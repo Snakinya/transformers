@@ -133,6 +133,7 @@ class GlmMoeDsaConfig(Glm4MoeLiteConfig):
     index_n_heads: int = 32
     pretraining_tp = AttributeError()
     rope_interleave = AttributeError()
+    layer_types: list[str] | None = None
 
     def __post_init__(self, **kwargs):
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -142,6 +143,9 @@ class GlmMoeDsaConfig(Glm4MoeLiteConfig):
             self.mlp_layer_types = ["dense"] * min(3, self.num_hidden_layers) + ["sparse"] * (
                 self.num_hidden_layers - 3
             )
+        # All layers use dynamic sparse attention (DSA indexer)
+        if self.layer_types is None:
+            self.layer_types = ["dynamic_sparse_attention"] * self.num_hidden_layers
         PreTrainedConfig.__post_init__(self, **kwargs)
 
 
@@ -157,10 +161,8 @@ class GlmMoeDsaIndexer(nn.Module):
     main MLA attention. It uses non-interleaved (NeoX/Llama) RoPE, unlike the main attention
     which uses interleaved RoPE.
 
-    **Cache strategy**: The Indexer manages its own key cache (`_cached_keys`) separately
-    from the DynamicCache used by MLA attention, since DynamicCache is sized for exactly
-    `num_hidden_layers` attention layers. Keys are concatenated along the sequence dimension
-    during autoregressive decode.
+    **Cache strategy**: The indexer key cache is stored in the `DynamicIndexedLayer` (or its
+    FP8 variant) inside the shared `DynamicCache`, accessed via `past_key_values.update_indexer()`.
     """
 
     def __init__(self, config: "GlmMoeDsaConfig", layer_idx: int):
@@ -185,9 +187,6 @@ class GlmMoeDsaIndexer(nn.Module):
         self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
 
-        # Indexer maintains its own key cache (not in DynamicCache, which is sized for attention layers only)
-        self._cached_keys: torch.Tensor | None = None
-
     @torch.no_grad()
     def forward(
         self,
@@ -195,7 +194,7 @@ class GlmMoeDsaIndexer(nn.Module):
         q_resid: torch.Tensor,  # [B, S, q_lora_rank]
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        use_cache: bool = False,
+        past_key_values: Cache | None = None,
     ) -> torch.LongTensor:
         """
         Computes top-k token indices for sparse attention (DSA).
@@ -213,69 +212,43 @@ class GlmMoeDsaIndexer(nn.Module):
             q_resid: Query residual from `q_a_layernorm(q_a_proj(x))`, shape `[B, S, q_lora_rank]`.
             position_embeddings: `(cos, sin)` from RotaryEmbedding.
             attention_mask: Causal mask, broadcastable to `[B, S, T]`.
-            use_cache: Whether to store/update the indexer's own key cache for autoregressive decode.
+            past_key_values: Cache object containing `DynamicIndexedLayer` for this layer.
 
         Returns:
             `torch.LongTensor`: Top-k token indices of shape `[B, S, topk]`.
         """
-        batch_size, seq_len, _ = hidden_states.shape
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings
 
-        # === Queries ===
-        q = self.wq_b(q_resid)  # [B, S, H*D]
-        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)  # [B, S, H, D]
-        q_pe, q_nope = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)  # [B, S, H, rope_D]
-        q = torch.cat([q_pe, q_nope], dim=-1)  # [B, S, H, D]
+        q = self.self.q_proj(q_resid).view(hidden_shape).transpose(1, 2)
+        q = apply_rotary_pos_emb(q, cos, sin) 
 
-        # === Keys ===
-        k = self.k_norm(self.wk(hidden_states))  # [B, S, D]
-        k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)  # [B, S, rope_D]
-        k = torch.cat([k_pe, k_nope], dim=-1)  # [B, S, D]
+        k = self.k_norm(self.k_proj(hidden_states)).transpose(1, 2)
+        k = apply_rotary_pos_emb(k, cos, sin)
 
-        # === Key cache (managed by the indexer, not DynamicCache) ===
-        # Reset cache on prefill (new prompt) to avoid stale keys / batch-size mismatch
-        if seq_len > 1:
-            self._cached_keys = None
+        if past_key_values is not None:
+            k = past_key_values.update_indexer(k, self.layer_idx)
+            # v does not need an update since its computed from query states already!
 
-        if use_cache:
-            if self._cached_keys is not None:
-                k_cached = torch.cat([self._cached_keys, k], dim=1)  # [B, T, D]
-            else:
-                k_cached = k
-            self._cached_keys = k_cached
-        else:
-            k_cached = k
-
-        # === Scoring ===
-        # Reference: weights = weights_proj(x.float()) * n_heads^(-0.5)
-        # Reference: weights = weights.unsqueeze(-1) * q_scale * softmax_scale
-        # Reference: index_score = fp8_index(q_fp8, weights, k_cache, k_scale_cache)
-        #
-        # In bf16 mode (no FP8), q_scale = 1. The fp8_index kernel computes:
-        #   score[b,s,t] = sum_h(weights[b,s,h] * dot(q[b,s,h,:], k[b,t,:]))
-        # where weights already absorbs n_heads^(-0.5) and softmax_scale.
-
-        # Don't force fp32 inputs here: the checkpoint stores `weights_proj.weight` in bf16.
-        # Use native dtype for matmul, then upcast the result for scoring stability.
-        weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)  # [B, S, H]
+        value_states = self.v_proj(hidden_states).float() 
 
         # q·k^T per head: [B, S, H, D] @ [B, T, D]^T → [B, S, H, T]
-        scores = torch.bmm(
+        attn_weights = torch.bmm(
             q.float().reshape(batch_size, seq_len * self.n_heads, self.head_dim),
-            k_cached.float().transpose(1, 2),
+            k.float().transpose(1, 2),
         )
-        scores = scores.view(batch_size, seq_len, self.n_heads, -1) * self.softmax_scale
-        scores = F.relu(scores)
+        attn_weights = attn_weights.view(batch_size, seq_len, self.n_heads, -1) * self.softmax_scale
+        attn_weights = F.relu(attn_weights)
+
         # Weight per head and sum across heads → [B, S, T]
-        index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
+        index_scores = torch.matmul(value_states.unsqueeze(-2)* (self.n_heads**-0.5), attn_weights).squeeze(-2)
 
         if attention_mask is not None:
             index_scores = index_scores + attention_mask
 
-        total_len = index_scores.shape[-1]
-        topk = min(self.index_topk, total_len)
+        topk = min(self.index_topk, index_scores.shape[-1])
+        # diff with classic attention, sample don't project :wink:
         topk_indices = index_scores.topk(topk, dim=-1).indices  # [B, S, topk]
         return topk_indices
 
@@ -411,7 +384,7 @@ class GlmMoeDsaAttention(nn.Module):
             q_resid,
             position_embeddings,
             indexer_mask,
-            use_cache=past_key_values is not None,
+            past_key_values=past_key_values,
         )  # [B, S, topk]
 
         # Build combined DSA + causal mask: -inf everywhere except selected top-k positions

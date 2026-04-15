@@ -244,6 +244,164 @@ class DynamicSlidingWindowLayer(DynamicLayer):
         self.cumulative_length = self.keys.shape[-2]
 
 
+class DynamicIndexedLayer(DynamicLayer):
+    """
+    A cache layer that extends `DynamicLayer` with an extra indexer key cache for Dynamic Sparse Attention (DSA)
+    models (e.g. GLM MoE DSA, DeepSeek V32).
+
+    The main K/V cache stores tensors of shape `[batch_size, num_heads, seq_len, head_dim]` (inherited).
+    The indexer key cache stores a tensor of shape `[batch_size, seq_len, index_head_dim]` (3D, single-head).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.indexer_keys: torch.Tensor | None = None
+        self.is_indexer_initialized: bool = False
+
+    def lazy_initialization_indexer(self, indexer_key_states: torch.Tensor) -> None:
+        self.indexer_dtype, self.indexer_device = indexer_key_states.dtype, indexer_key_states.device
+        self.indexer_keys = torch.tensor([], dtype=self.indexer_dtype, device=self.indexer_device)
+        self.is_indexer_initialized = True
+
+    def update_indexer(self, indexer_key_states: torch.Tensor) -> torch.Tensor:
+        """
+        Update the indexer key cache by concatenation, and return the full indexer keys.
+
+        Args:
+            indexer_key_states (`torch.Tensor`): New indexer keys, shape `[batch_size, seq_len, index_head_dim]`.
+
+        Returns:
+            `torch.Tensor`: The full cached indexer keys, shape `[batch_size, total_len, index_head_dim]`.
+        """
+        if not self.is_indexer_initialized:
+            self.lazy_initialization_indexer(indexer_key_states)
+        self.indexer_keys = torch.cat([self.indexer_keys, indexer_key_states], dim=1)
+        return self.indexer_keys
+
+    def offload(self):
+        super().offload()
+        if self.is_indexer_initialized:
+            self.indexer_keys = self.indexer_keys.to("cpu", non_blocking=True)
+
+    def prefetch(self):
+        super().prefetch()
+        if self.is_indexer_initialized and self.indexer_keys.device != self.device:
+            self.indexer_keys = self.indexer_keys.to(self.device, non_blocking=True)
+
+    def reset(self) -> None:
+        super().reset()
+        if self.is_indexer_initialized:
+            self.indexer_keys.zero_()
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        super().reorder_cache(beam_idx)
+        if self.is_indexer_initialized and self.indexer_keys.numel() > 0:
+            self.indexer_keys = self.indexer_keys.index_select(0, beam_idx.to(self.indexer_keys.device))
+
+    def crop(self, max_length: int) -> None:
+        super().crop(max_length)
+        if not self.is_indexer_initialized or self.indexer_keys.numel() == 0:
+            return
+        effective = max_length if max_length >= 0 else self.indexer_keys.shape[1] - abs(max_length)
+        if self.indexer_keys.shape[1] > effective:
+            self.indexer_keys = self.indexer_keys[:, :effective, :]
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        super().batch_repeat_interleave(repeats)
+        if self.is_indexer_initialized and self.indexer_keys.numel() > 0:
+            self.indexer_keys = self.indexer_keys.repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        super().batch_select_indices(indices)
+        if self.is_indexer_initialized and self.indexer_keys.numel() > 0:
+            self.indexer_keys = self.indexer_keys[indices, ...]
+
+
+class FP8DynamicIndexedLayer(DynamicIndexedLayer):
+    """
+    A `DynamicIndexedLayer` that stores indexer keys in `float8_e4m3fn` with per-token scaling.
+
+    This matches the reference model's `fp8_index` kernel behavior where the key cache is stored in FP8
+    with a separate scale tensor. Memory savings are ~75% for `index_head_dim=128` (132 bytes/token in
+    FP8+scale vs 512 bytes in FP32).
+
+    Storage layout:
+        - `self.indexer_keys`: `[batch_size, seq_len, index_head_dim]` in `float8_e4m3fn`
+        - `self._indexer_keys_scale`: `[batch_size, seq_len, 1]` in `float32`
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._indexer_keys_scale: torch.Tensor | None = None
+
+    def update_indexer(self, indexer_key_states: torch.Tensor) -> torch.Tensor:
+        """
+        Quantize new indexer keys to FP8, concatenate with the cache, and return dequantized full cache.
+
+        Args:
+            indexer_key_states (`torch.Tensor`): New indexer keys, shape `[batch_size, seq_len, index_head_dim]`.
+
+        Returns:
+            `torch.Tensor`: Dequantized full cached indexer keys in the original dtype.
+        """
+        # Per-token scale: max(|x|) per [B, S] position
+        amax = indexer_key_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+        scale = amax / torch.finfo(torch.float8_e4m3fn).max
+        fp8_new = (indexer_key_states / scale).to(torch.float8_e4m3fn)
+
+        if not self.is_indexer_initialized:
+            self.indexer_dtype, self.indexer_device = indexer_key_states.dtype, indexer_key_states.device
+            self.indexer_keys = fp8_new
+            self._indexer_keys_scale = scale
+            self.is_indexer_initialized = True
+        else:
+            self.indexer_keys = torch.cat([self.indexer_keys, fp8_new], dim=1)
+            self._indexer_keys_scale = torch.cat([self._indexer_keys_scale, scale], dim=1)
+
+        # Dequantize for scoring (the indexer runs in float32)
+        return self.indexer_keys.to(self.indexer_dtype) * self._indexer_keys_scale
+
+    def offload(self):
+        super().offload()
+        if self._indexer_keys_scale is not None:
+            self._indexer_keys_scale = self._indexer_keys_scale.to("cpu", non_blocking=True)
+
+    def prefetch(self):
+        super().prefetch()
+        if self._indexer_keys_scale is not None and self._indexer_keys_scale.device != self.device:
+            self._indexer_keys_scale = self._indexer_keys_scale.to(self.device, non_blocking=True)
+
+    def reset(self) -> None:
+        super().reset()
+        if self._indexer_keys_scale is not None:
+            self._indexer_keys_scale.zero_()
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        super().reorder_cache(beam_idx)
+        if self._indexer_keys_scale is not None and self._indexer_keys_scale.numel() > 0:
+            self._indexer_keys_scale = self._indexer_keys_scale.index_select(
+                0, beam_idx.to(self._indexer_keys_scale.device)
+            )
+
+    def crop(self, max_length: int) -> None:
+        super().crop(max_length)
+        if self._indexer_keys_scale is None or self._indexer_keys_scale.numel() == 0:
+            return
+        effective = max_length if max_length >= 0 else self._indexer_keys_scale.shape[1] - abs(max_length)
+        if self._indexer_keys_scale.shape[1] > effective:
+            self._indexer_keys_scale = self._indexer_keys_scale[:, :effective, :]
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        super().batch_repeat_interleave(repeats)
+        if self._indexer_keys_scale is not None and self._indexer_keys_scale.numel() > 0:
+            self._indexer_keys_scale = self._indexer_keys_scale.repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        super().batch_select_indices(indices)
+        if self._indexer_keys_scale is not None and self._indexer_keys_scale.numel() > 0:
+            self._indexer_keys_scale = self._indexer_keys_scale[indices, ...]
+
+
 class StaticLayer(CacheLayerMixin):
     """
     A static cache layer that stores the key and value states as static tensors of shape `[batch_size, num_heads, max_cache_len), head_dim]`.
@@ -981,6 +1139,26 @@ class Cache:
         recurrent_states = self.layers[layer_idx].update_recurrent_state(recurrent_states, **kwargs)
         return recurrent_states
 
+    def update_indexer(self, indexer_key_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        """
+        Updates the indexer key cache for layer `layer_idx`.
+
+        Parameters:
+            indexer_key_states (`torch.Tensor`):
+                The new indexer key states to cache, shape `[batch_size, seq_len, index_head_dim]`.
+            layer_idx (`int`):
+                The index of the layer to cache the states for.
+
+        Return:
+            `torch.Tensor`: The updated indexer key states (full cache).
+        """
+        if not isinstance(self.layers[layer_idx], DynamicIndexedLayer):
+            raise ValueError(
+                f"Cannot call `update_indexer` on layer {layer_idx} which is a "
+                f"{type(self.layers[layer_idx]).__name__}, not a DynamicIndexedLayer!"
+            )
+        return self.layers[layer_idx].update_indexer(indexer_key_states)
+
     def early_initialization(
         self,
         batch_size: int,
@@ -1252,27 +1430,36 @@ class DynamicCache(Cache):
                     layers.append(LinearAttentionLayer())
                 elif layer_type == "hybrid":
                     layers.append(LinearAttentionAndFullAttentionLayer())
+                elif layer_type == "dynamic_sparse_attention":
+                    layers.append(DynamicIndexedLayer())
                 else:
                     layers.append(DynamicLayer())
 
         # In this case, use the passed data to already fill in the Cache
         if ddp_cache_data is not None:
             # Init all the layers with the data
-            for layer_idx, kv_and_optional_sliding in enumerate(ddp_cache_data):
+            for layer_idx, data in enumerate(ddp_cache_data):
                 # If the config was not passed above, initialize a new cache layer for each entry of the ddp_data
                 if config is None:
-                    # kv_and_optional_sliding contains at least two elements: the key and value states. It can also
-                    # contain a third element, which is an optional sliding window tensor.
-                    sliding_window_tensor = kv_and_optional_sliding[2] if len(kv_and_optional_sliding) == 3 else None
-                    # If there is a sliding window tensor, use it to initialize the layer
-                    if sliding_window_tensor is not None:
+                    # data contains at least two elements: the key and value states. It can also contain:
+                    # - a 3rd element: optional sliding window tensor
+                    # - a 4th element: optional indexer keys tensor
+                    sliding_window_tensor = data[2] if len(data) > 2 else None
+                    indexer_keys_tensor = data[3] if len(data) > 3 else None
+                    if indexer_keys_tensor is not None:
+                        layers.append(DynamicIndexedLayer())
+                    elif sliding_window_tensor is not None:
                         # Since the same layer is dispatched across replicas, sliding_window is the same for all
                         sliding_window = sliding_window_tensor[0].item()
                         layers.append(DynamicSlidingWindowLayer(sliding_window=sliding_window))
                     else:
                         layers.append(DynamicLayer())
                 # Update the layer with the data
-                _, _ = layers[layer_idx].update(kv_and_optional_sliding[0], kv_and_optional_sliding[1])
+                _, _ = layers[layer_idx].update(data[0], data[1])
+                # Restore indexer keys if present
+                indexer_keys_tensor = data[3] if len(data) > 3 else None
+                if indexer_keys_tensor is not None and isinstance(layers[layer_idx], DynamicIndexedLayer):
+                    layers[layer_idx].update_indexer(indexer_keys_tensor)
 
         # If neither of config nor ddp_data was passed, then simply lazy init a full cache of DynamicLayer
         if len(layers) == 0:
@@ -1286,7 +1473,12 @@ class DynamicCache(Cache):
 
     def __iter__(self):
         for layer in self.layers:
-            yield layer.keys, layer.values, getattr(layer, "_sliding_window_tensor", None)
+            yield (
+                layer.keys,
+                layer.values,
+                getattr(layer, "_sliding_window_tensor", None),
+                getattr(layer, "indexer_keys", None),
+            )
 
 
 class StaticCache(Cache):
@@ -1364,6 +1556,9 @@ class StaticCache(Cache):
             # LinearAttention layers are static by essence - using `"moe"` as well is a trick, see the comment about it on DynamicCache
             elif layer_type in ("mamba", "conv", "linear_attention", "moe"):
                 layer = LinearAttentionLayer()
+            elif layer_type == "dynamic_sparse_attention":
+                # No static variant yet — use the dynamic indexed layer
+                layer = DynamicIndexedLayer()
             else:
                 layer = StaticLayer(max_cache_len=max_cache_len)
             layers.append(layer)

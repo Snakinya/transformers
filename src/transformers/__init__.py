@@ -365,6 +365,8 @@ else:
     _import_structure["cache_utils"] = [
         "CacheLayerMixin",
         "DynamicLayer",
+        "DynamicIndexedLayer",
+        "FP8DynamicIndexedLayer",
         "StaticLayer",
         "StaticSlidingWindowLayer",
         "QuantoQuantizedLayer",
@@ -485,8 +487,10 @@ if TYPE_CHECKING:
     from .backbone_utils import BackboneConfigMixin, BackboneMixin
     from .cache_utils import Cache as Cache
     from .cache_utils import DynamicCache as DynamicCache
+    from .cache_utils import DynamicIndexedLayer as DynamicIndexedLayer
     from .cache_utils import DynamicLayer as DynamicLayer
     from .cache_utils import EncoderDecoderCache as EncoderDecoderCache
+    from .cache_utils import FP8DynamicIndexedLayer as FP8DynamicIndexedLayer
     from .cache_utils import HQQQuantizedLayer as HQQQuantizedLayer
     from .cache_utils import QuantizedCache as QuantizedCache
     from .cache_utils import QuantoQuantizedLayer as QuantoQuantizedLayer
