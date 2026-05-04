@@ -250,11 +250,12 @@ class GlmMoeDsaIndexer(nn.Module):
             `torch.LongTensor`: Top-k token indices of shape `[B, S, topk]`.
         """
         input_shape = hidden_states.shape[:-1]
+        batch_size, seq_len = input_shape
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings
 
         q = self.self.q_proj(q_resid).view(hidden_shape).transpose(1, 2)
-        q = apply_rotary_pos_emb(q, cos, sin) 
+        q = apply_rotary_pos_emb(q, cos, sin)
 
         k = self.k_norm(self.k_proj(hidden_states)).transpose(1, 2)
         k = apply_rotary_pos_emb(k, cos, sin)
@@ -263,7 +264,7 @@ class GlmMoeDsaIndexer(nn.Module):
             k = past_key_values.update_indexer(k, self.layer_idx)
             # v does not need an update since its computed from query states already!
 
-        value_states = self.v_proj(hidden_states).float() 
+        value_states = self.v_proj(hidden_states).float()
 
         # q·k^T per head: [B, S, H, D] @ [B, T, D]^T → [B, S, H, T]
         attn_weights = torch.bmm(
@@ -274,7 +275,7 @@ class GlmMoeDsaIndexer(nn.Module):
         attn_weights = F.relu(attn_weights)
 
         # Weight per head and sum across heads → [B, S, T]
-        index_scores = torch.matmul(value_states.unsqueeze(-2)* (self.n_heads**-0.5), attn_weights).squeeze(-2)
+        index_scores = torch.matmul(value_states.unsqueeze(-2) * (self.n_heads**-0.5), attn_weights).squeeze(-2)
 
         if attention_mask is not None:
             index_scores = index_scores + attention_mask

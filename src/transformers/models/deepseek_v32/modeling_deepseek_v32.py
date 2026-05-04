@@ -22,8 +22,8 @@ from collections.abc import Callable
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
 
 from ... import initialization as init
 from ...activations import ACT2FN
@@ -139,7 +139,7 @@ class DeepseekV32MoE(nn.Module):
             .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
             .reshape(-1, self.n_routed_experts)
         )
-        scores_for_choice = router_logits_for_choice.masked_fill(~score_mask.bool(), 0.0)
+        scores_for_choice = router_logits_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
         topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
         topk_weights = router_logits.gather(1, topk_indices)
         if self.norm_topk_prob:
@@ -294,16 +294,14 @@ def apply_rotary_pos_emb(
 
 class DeepseekV32Indexer(nn.Module):
     """
-    Dynamic Sparse Attention (DSA) indexer for selecting top-k tokens.
+    DeepSeek Sparse Attention (DSA) indexer for selecting top-k tokens.
 
     The Indexer has its own lightweight projections (wq_b, wk) separate from the
     main MLA attention. It uses non-interleaved (NeoX/Llama) RoPE, unlike the main attention
     which uses interleaved RoPE.
 
-    **Cache strategy**: The Indexer manages its own key cache (`_cached_keys`) separately
-    from the DynamicCache used by MLA attention, since DynamicCache is sized for exactly
-    `num_hidden_layers` attention layers. Keys are concatenated along the sequence dimension
-    during autoregressive decode.
+    **Cache strategy**: The indexer key cache is stored in the `DynamicIndexedLayer` (or its
+    FP8 variant) inside the shared `DynamicCache`, accessed via `past_key_values.update_indexer()`.
     """
 
     def __init__(self, config: "DeepseekV32Config", layer_idx: int):
@@ -328,8 +326,9 @@ class DeepseekV32Indexer(nn.Module):
         self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
 
-        # Indexer maintains its own key cache (not in DynamicCache, which is sized for attention layers only)
-        self._cached_keys: torch.Tensor | None = None
+        # Indexer key cache lives on the per-layer ``DynamicIndexedLayer`` (registered via
+        # ``LAYER_TYPE_CACHE_MAPPING["dynamic_sparse_attention"]``), not on the module —
+        # mirrors V4's pattern where compressor / indexer state hangs off the cache layer.
 
     @torch.no_grad()
     def forward(
@@ -338,7 +337,7 @@ class DeepseekV32Indexer(nn.Module):
         q_resid: torch.Tensor,  # [B, S, q_lora_rank]
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
-        use_cache: bool = False,
+        past_key_values: Cache | None = None,
     ) -> torch.LongTensor:
         """
         Computes top-k token indices for sparse attention (DSA).
@@ -356,69 +355,44 @@ class DeepseekV32Indexer(nn.Module):
             q_resid: Query residual from `q_a_layernorm(q_a_proj(x))`, shape `[B, S, q_lora_rank]`.
             position_embeddings: `(cos, sin)` from RotaryEmbedding.
             attention_mask: Causal mask, broadcastable to `[B, S, T]`.
-            use_cache: Whether to store/update the indexer's own key cache for autoregressive decode.
+            past_key_values: Cache object containing `DynamicIndexedLayer` for this layer.
 
         Returns:
             `torch.LongTensor`: Top-k token indices of shape `[B, S, topk]`.
         """
-        batch_size, seq_len, _ = hidden_states.shape
+        input_shape = hidden_states.shape[:-1]
+        batch_size, seq_len = input_shape
+        hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings
 
-        # === Queries ===
-        q = self.wq_b(q_resid)  # [B, S, H*D]
-        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)  # [B, S, H, D]
-        q_pe, q_nope = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)  # [B, S, H, rope_D]
-        q = torch.cat([q_pe, q_nope], dim=-1)  # [B, S, H, D]
+        q = self.self.q_proj(q_resid).view(hidden_shape).transpose(1, 2)
+        q = apply_rotary_pos_emb(q, cos, sin)
 
-        # === Keys ===
-        k = self.k_norm(self.wk(hidden_states))  # [B, S, D]
-        k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)  # [B, S, rope_D]
-        k = torch.cat([k_pe, k_nope], dim=-1)  # [B, S, D]
+        k = self.k_norm(self.k_proj(hidden_states)).transpose(1, 2)
+        k = apply_rotary_pos_emb(k, cos, sin)
 
-        # === Key cache (managed by the indexer, not DynamicCache) ===
-        # Reset cache on prefill (new prompt) to avoid stale keys / batch-size mismatch
-        if seq_len > 1:
-            self._cached_keys = None
+        if past_key_values is not None:
+            k = past_key_values.update_indexer(k, self.layer_idx)
+            # v does not need an update since its computed from query states already!
 
-        if use_cache:
-            if self._cached_keys is not None:
-                k_cached = torch.cat([self._cached_keys, k], dim=1)  # [B, T, D]
-            else:
-                k_cached = k
-            self._cached_keys = k_cached
-        else:
-            k_cached = k
-
-        # === Scoring ===
-        # Reference: weights = weights_proj(x.float()) * n_heads^(-0.5)
-        # Reference: weights = weights.unsqueeze(-1) * q_scale * softmax_scale
-        # Reference: index_score = fp8_index(q_fp8, weights, k_cache, k_scale_cache)
-        #
-        # In bf16 mode (no FP8), q_scale = 1. The fp8_index kernel computes:
-        #   score[b,s,t] = sum_h(weights[b,s,h] * dot(q[b,s,h,:], k[b,t,:]))
-        # where weights already absorbs n_heads^(-0.5) and softmax_scale.
-
-        # Don't force fp32 inputs here: the checkpoint stores `weights_proj.weight` in bf16.
-        # Use native dtype for matmul, then upcast the result for scoring stability.
-        weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)  # [B, S, H]
+        value_states = self.v_proj(hidden_states).float()
 
         # q·k^T per head: [B, S, H, D] @ [B, T, D]^T → [B, S, H, T]
-        scores = torch.bmm(
+        attn_weights = torch.bmm(
             q.float().reshape(batch_size, seq_len * self.n_heads, self.head_dim),
-            k_cached.float().transpose(1, 2),
+            k.float().transpose(1, 2),
         )
-        scores = scores.view(batch_size, seq_len, self.n_heads, -1) * self.softmax_scale
-        scores = F.relu(scores)
+        attn_weights = attn_weights.view(batch_size, seq_len, self.n_heads, -1) * self.softmax_scale
+        attn_weights = F.relu(attn_weights)
+
         # Weight per head and sum across heads → [B, S, T]
-        index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
+        index_scores = torch.matmul(value_states.unsqueeze(-2) * (self.n_heads**-0.5), attn_weights).squeeze(-2)
 
         if attention_mask is not None:
             index_scores = index_scores + attention_mask
 
-        total_len = index_scores.shape[-1]
-        topk = min(self.index_topk, total_len)
+        topk = min(self.index_topk, index_scores.shape[-1])
+        # diff with classic attention, sample don't project :wink:
         topk_indices = index_scores.topk(topk, dim=-1).indices  # [B, S, topk]
         return topk_indices
 
@@ -462,7 +436,7 @@ def eager_attention_forward(
 
 class DeepseekV32Attention(nn.Module):
     """
-    Multi-head Latent Attention (MLA) with Dynamic Sparse Attention (DSA) indexer.
+    Multi-head Latent Attention (MLA) with DeepSeek Sparse Attention (DSA) indexer.
 
     This follows the same architecture as DeepSeek V3.2's MLA:
       - Query: x → q_a_proj → RMSNorm → q_b_proj → split(q_nope, q_pe) → RoPE(q_pe)
@@ -529,14 +503,23 @@ class DeepseekV32Attention(nn.Module):
 
         self.indexer = DeepseekV32Indexer(config, layer_idx)
 
+        # Refer: https://arxiv.org/abs/2603.12201 for more details.
+        # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
+        # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
+        self.skip_topk = config.indexer_types[layer_idx] == "shared"
+        self.next_skip_topk = (
+            config.indexer_types[layer_idx + 1] == "shared" if layer_idx < len(config.indexer_types) - 1 else False
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         batch_size, seq_length = hidden_states.shape[:-1]
         cos, sin = position_embeddings
 
@@ -579,20 +562,25 @@ class DeepseekV32Attention(nn.Module):
 
         # ===== Indexer (DSA sparse mask) =====
         # attention_mask is [B, 1, S, T] (4D) for eager and (2D) otherwise but indexer works with [B, S, T] (3D)
-        indexer_mask = (
-            attention_mask[:, 0, :, :]
-            if attention_mask is not None and attention_mask.dim() == 4
-            else attention_mask.unsqueeze(1)
-            if attention_mask is not None
-            else None
-        )
-        topk_indices = self.indexer(
-            hidden_states,
-            q_resid,
-            position_embeddings,
-            indexer_mask,
-            use_cache=past_key_values is not None,
-        )  # [B, S, topk]
+        if not self.skip_topk or prev_topk_indices is None:
+            indexer_mask = (
+                attention_mask[:, 0, :, :]
+                if attention_mask is not None and attention_mask.dim() == 4
+                else attention_mask.unsqueeze(1)
+                if attention_mask is not None
+                else None
+            )
+            # Pass the cache through (V4 pattern): the indexer reads / writes its key
+            # state on the layer's ``DynamicIndexedLayer``, not on a private buffer.
+            topk_indices = self.indexer(
+                hidden_states,
+                q_resid,
+                position_embeddings,
+                indexer_mask,
+                past_key_values=past_key_values,
+            )  # [B, S, topk]
+        else:
+            topk_indices = prev_topk_indices  # [B, S, topk]
 
         # Build combined DSA + causal mask: -inf everywhere except selected top-k positions
         total_len = key_states.shape[2]
@@ -639,7 +627,7 @@ class DeepseekV32Attention(nn.Module):
 
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, attn_weights, topk_indices if self.next_skip_topk else None
 
 
 class DeepseekV32DecoderLayer(GradientCheckpointingLayer):
@@ -664,18 +652,20 @@ class DeepseekV32DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states, _, topk_indices = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
+            prev_topk_indices=prev_topk_indices,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -685,7 +675,7 @@ class DeepseekV32DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, topk_indices
 
 
 @auto_docstring
@@ -779,14 +769,16 @@ class DeepseekV32Model(DeepseekV32PreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
 
+        topk_indices = None
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+            hidden_states, topk_indices = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
+                prev_topk_indices=topk_indices,
                 **kwargs,
             )
 

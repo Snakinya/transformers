@@ -1226,6 +1226,7 @@ class MoeIdentityExpertParallel(TensorParallelLayer):
     def prepare_module_tp(self, module, device_mesh, **kwargs):
         distribute_module(module, device_mesh, input_fn=self._prepare_input_fn)
 
+
 class GatherParallel(TensorParallelLayer):
     """
     A general parallel style that gathers the full tensor in the forward pass and splits it in the backward pass.
@@ -1266,7 +1267,7 @@ class ParallelInterface(GeneralInterface):
             "moe_identity_expert": MoeIdentityExpertParallel(),
             "replicated_with_grad_allreduce": ReplicatedWithGradAllReduce(),
             "mla_kv_a_proj": MlaKvAProjParallel(),
-            "gather": GatherParallel()
+            "gather": GatherParallel(),
         }
         if is_torch_available() and _torch_distributed_available
         else {}

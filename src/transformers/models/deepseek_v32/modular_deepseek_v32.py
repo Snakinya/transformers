@@ -11,30 +11,64 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 
 import torch
-from torch import nn
 
-from ...cache_utils import Cache
-from ..glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaIndexer, GlmMoeDsaAttention, GlmMoeDsaRotaryEmbedding, GlmMoeDsaMLP, GlmMoeDsaExperts, GlmMoeDsaRMSNorm, GlmMoeDsaDecoderLayer, GlmMoeDsaPreTrainedModel, GlmMoeDsaModel, GlmMoeDsaForCausalLM, GlmMoeDsaMoE
-from ..glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 from ...modeling_rope_utils import RotaryEmbeddingConfigMixin
+from ...utils import auto_docstring
+from ..glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+from ..glm_moe_dsa.modeling_glm_moe_dsa import (
+    GlmMoeDsaAttention,
+    GlmMoeDsaDecoderLayer,
+    GlmMoeDsaForCausalLM,
+    GlmMoeDsaIndexer,
+    GlmMoeDsaMLP,
+    GlmMoeDsaModel,
+    GlmMoeDsaMoE,
+    GlmMoeDsaPreTrainedModel,
+    GlmMoeDsaRMSNorm,
+    GlmMoeDsaRotaryEmbedding,
+)
+
+
 # TODO
 # Use our rope and convert qkv with rope rotation to benefit from kernels\
 
+
 @auto_docstring(checkpoint="deepseek-ai/DeepSeek-V2-Lite")
 class DeepseekV32Config(GlmMoeDsaConfig, RotaryEmbeddingConfigMixin):
-    attribute_map = {
-        "num_local_experts": "num_experts"
-    } 
+    r"""
+    n_group (`int`, *optional*, defaults to 1):
+        Number of groups for routed experts.
+    mlp_layer_types (`list`, *optional*):
+        MLP type pattern for each layer (`"dense"` or `"sparse"`). Defaults to 3 dense + rest sparse.
+    index_topk (`int`, *optional*, defaults to 2048):
+        Number of top tokens selected by the indexer for sparse attention.
+    index_head_dim (`int`, *optional*, defaults to 128):
+        Head dimension for the indexer projections (DSA).
+    index_n_heads (`int`, *optional*, defaults to 32):
+        Number of heads for the indexer projections (DSA).
+    indexer_types (`list[str]`, *optional*):
+        Per-layer indexer mode (`"full"` runs the indexer, `"shared"` reuses the previous
+        layer's top-k). Defaults to first layer full, then every `index_topk_freq`-th layer
+        full, rest shared.
+    index_top_k (`int`, *optional*, defaults to 2048):
+        Number of top tokens selected by the indexer for sparse attention. V3.2 keeps this
+        as a separate field from the parent's `index_topk` to match the upstream config name.
+    max_seq_len (`int`, *optional*, defaults to 2048):
+        Maximum sequence length the indexer is calibrated for. Used by the indexer's
+        positional bookkeeping; not the model's hard context limit.
+    """
+
+    attribute_map = {"num_local_experts": "num_experts"}
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_top_k: int = 2048
     max_seq_len: int = 2048
     mlp_bias: bool = False
-    num_experts:int = 256
+    num_experts: int = 256
     head_dim: int = 64
+
 
 def apply_rotary_pos_emb(
     x: torch.Tensor,
@@ -64,6 +98,7 @@ def apply_rotary_pos_emb(
     x2 = x[..., 1::2]
     return torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).flatten(-2)
 
+
 class DeepseekV32MoE(GlmMoeDsaMoE):
     pass
 
@@ -86,6 +121,7 @@ class DeepseekV32Indexer(GlmMoeDsaIndexer):
 
 class DeepseekV32Attention(GlmMoeDsaAttention):
     pass
+
 
 class DeepseekV32DecoderLayer(GlmMoeDsaDecoderLayer):
     pass

@@ -119,6 +119,12 @@ class GlmMoeDsaConfig(PreTrainedConfig):
     index_topk: int = 2048
     index_head_dim: int = 128
     index_n_heads: int = 32
+    # ``layer_types`` drives cache-class dispatch (every layer is DSA, so each
+    # gets a ``DynamicIndexedLayer`` via ``LAYER_TYPE_CACHE_MAPPING``).
+    # ``indexer_types`` is orthogonal — it controls per-layer indexer behaviour
+    # (`"full"` = run the indexer, `"shared"` = reuse the previous layer's
+    # top-k, gating the per-layer Q/K compute on long-context decoding).
+    layer_types: list[str] | None = None
     indexer_types: list[str] | None = None
 
     def __post_init__(self, **kwargs):
@@ -129,8 +135,11 @@ class GlmMoeDsaConfig(PreTrainedConfig):
             self.mlp_layer_types = ["dense"] * min(3, self.num_hidden_layers) + ["sparse"] * (
                 self.num_hidden_layers - 3
             )
-
-        # Indexer layer types
+        # All layers use dynamic sparse attention (DSA indexer) — drives cache-class dispatch.
+        if self.layer_types is None:
+            self.layer_types = ["dynamic_sparse_attention"] * self.num_hidden_layers
+        # Per-layer indexer mode: `"full"` runs the indexer, `"shared"` reuses
+        # the previous layer's top-k. Pattern (e.g. `"FSSF..."`) overrides freq.
         if self.indexer_types is None:
             pattern = kwargs.pop("index_topk_pattern", None)
             freq = kwargs.pop("index_topk_freq", 1)

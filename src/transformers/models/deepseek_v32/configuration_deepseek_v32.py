@@ -17,6 +17,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
 from ...configuration_utils import PreTrainedConfig
 from ...modeling_rope_utils import RopeParameters, RotaryEmbeddingConfigMixin
 from ...utils import auto_docstring
@@ -33,21 +35,19 @@ class DeepseekV32Config(PreTrainedConfig, RotaryEmbeddingConfigMixin):
         Number of top tokens selected by the indexer for sparse attention.
     index_head_dim (`int`, *optional*, defaults to 128):
         Head dimension for the indexer projections (DSA).
-    index_n_heads (`int | None`, *optional*, defaults to 32):
+    index_n_heads (`int`, *optional*, defaults to 32):
         Number of heads for the indexer projections (DSA).
-
-    ```python
-    >>> from transformers import DeepseekV32Config, DeepseekV32Model
-
-    >>> # Initializing a GLM-MoE-DSA configuration
-    >>> configuration = DeepseekV32Config()
-
-    >>> # Initializing a model from the configuration
-    >>> model = DeepseekV32Model(configuration)
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```"""
+    indexer_types (`list[str]`, *optional*):
+        Per-layer indexer mode (`"full"` runs the indexer, `"shared"` reuses the previous
+        layer's top-k). Defaults to first layer full, then every `index_topk_freq`-th layer
+        full, rest shared.
+    index_top_k (`int`, *optional*, defaults to 2048):
+        Number of top tokens selected by the indexer for sparse attention. V3.2 keeps this
+        as a separate field from the parent's `index_topk` to match the upstream config name.
+    max_seq_len (`int`, *optional*, defaults to 2048):
+        Maximum sequence length the indexer is calibrated for. Used by the indexer's
+        positional bookkeeping; not the model's hard context limit.
+    """
 
     model_type = "deepseek_v32"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -72,6 +72,7 @@ class DeepseekV32Config(PreTrainedConfig, RotaryEmbeddingConfigMixin):
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
         "norm": (["hidden_states"], ["hidden_states"]),
     }
+
     attribute_map = {"num_local_experts": "num_experts"}
 
     vocab_size: int = 154880
@@ -110,6 +111,13 @@ class DeepseekV32Config(PreTrainedConfig, RotaryEmbeddingConfigMixin):
     index_topk: int = 2048
     index_head_dim: int = 128
     index_n_heads: int = 64
+    # ``layer_types`` drives cache-class dispatch (every layer is DSA, so each
+    # gets a ``DynamicIndexedLayer`` via ``LAYER_TYPE_CACHE_MAPPING``).
+    # ``indexer_types`` is orthogonal — it controls per-layer indexer behaviour
+    # (`"full"` = run the indexer, `"shared"` = reuse the previous layer's
+    # top-k, gating the per-layer Q/K compute on long-context decoding).
+    layer_types: list[str] | None = None
+    indexer_types: list[str] | None = None
     index_top_k: int = 2048
     max_seq_len: int = 2048
     mlp_bias: bool = False
@@ -124,6 +132,23 @@ class DeepseekV32Config(PreTrainedConfig, RotaryEmbeddingConfigMixin):
             self.mlp_layer_types = ["dense"] * min(3, self.num_hidden_layers) + ["sparse"] * (
                 self.num_hidden_layers - 3
             )
+        # All layers use dynamic sparse attention (DSA indexer) — drives cache-class dispatch.
+        if self.layer_types is None:
+            self.layer_types = ["dynamic_sparse_attention"] * self.num_hidden_layers
+        # Per-layer indexer mode: `"full"` runs the indexer, `"shared"` reuses
+        # the previous layer's top-k. Pattern (e.g. `"FSSF..."`) overrides freq.
+        if self.indexer_types is None:
+            pattern = kwargs.pop("index_topk_pattern", None)
+            freq = kwargs.pop("index_topk_freq", 1)
+            if pattern is not None:
+                self.indexer_types = (
+                    [{"F": "full", "S": "shared"}[c] for c in pattern] if isinstance(pattern, str) else list(pattern)
+                )
+            else:
+                # First layer full, then every freq-th layer full, rest shared
+                self.indexer_types = [
+                    "full" if (max(i - 1, 0) % freq) == 0 else "shared" for i in range(self.num_hidden_layers)
+                ]
         super().__post_init__(**kwargs)
 
 
