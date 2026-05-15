@@ -120,7 +120,7 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("fastspeech2_conformer", "FastSpeech2ConformerTokenizer" if is_g2p_en_available() else None),
         ("flaubert", "FlaubertTokenizer"),
         ("flava", "BertTokenizer" if is_tokenizers_available() else None),
-        ("flex_olmo", "GPT2Tokenizer" if is_tokenizers_available() else None),
+        ("flex_olmo", "TokenizersBackend" if is_tokenizers_available() else None),
         ("florence2", "BartTokenizer" if is_tokenizers_available() else None),
         ("fnet", "FNetTokenizer" if is_tokenizers_available() else None),
         ("fsmt", "FSMTTokenizer"),
@@ -391,7 +391,7 @@ MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS: set[str] = {
     "cohere_asr",
     "camembertv2-base",
     "smolvlm",
-    "vision-encoder-decoder"
+    "vision-encoder-decoder",
 }
 
 for model_type in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS:
@@ -732,7 +732,12 @@ class AutoTokenizer:
             != (tokenizer_config_class.removesuffix("Fast"))
         ):
             registered_class_name = TOKENIZER_MAPPING_NAMES.get(config_model_type).removesuffix("Fast")
-            if registered_class_name not in ("TokenizersBackend", "PythonBackend", "PreTrainedTokenizerFast"):
+            if registered_class_name not in (
+                "TokenizersBackend",
+                "PythonBackend",
+                "PreTrainedTokenizerFast",
+                "MistralCommonBackend",
+            ):
                 # If the hub class is known incorrect for this model type, use the registered class; otherwise trust the hub.
                 class_name = (
                     registered_class_name
