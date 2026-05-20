@@ -63,9 +63,11 @@ REGISTERED_FAST_ALIASES: dict[str, type[Any]] = {}
 
 TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
     [
+        ("EvollaModel", "TokenizersBackend" if is_tokenizers_available() else None),
         ("aimv2", "CLIPTokenizer" if is_tokenizers_available() else None),
         ("albert", "AlbertTokenizer" if is_tokenizers_available() else None),
         ("align", "BertTokenizer" if is_tokenizers_available() else None),
+        ("aria", "TokenizersBackend" if is_tokenizers_available() else None),
         ("audioflamingo3", "Qwen2Tokenizer" if is_tokenizers_available() else None),
         ("aya_vision", "CohereTokenizer" if is_tokenizers_available() else None),
         ("bark", "BertTokenizer" if is_tokenizers_available() else None),
@@ -77,12 +79,12 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("bert-japanese", "BertJapaneseTokenizer"),
         ("bertweet", "BertweetTokenizer"),
         ("big_bird", "BigBirdTokenizer" if is_tokenizers_available() else None),
-        ("bigbird_pegasus", "PegasusTokenizer" if is_tokenizers_available() else None),
+        ("bigbird_pegasus", "TokenizersBackend" if is_tokenizers_available() else None),
         ("biogpt", "BioGptTokenizer"),
         ("blenderbot", "BlenderbotTokenizer" if is_tokenizers_available() else None),
         ("blenderbot-small", "BlenderbotSmallTokenizer"),
         ("blip", "BertTokenizer" if is_tokenizers_available() else None),
-        ("blip-2", "GPT2Tokenizer" if is_tokenizers_available() else None),
+        ("blip-2", "TokenizersBackend" if is_tokenizers_available() else None),
         ("bridgetower", "RobertaTokenizer"),
         ("bros", "BertTokenizer" if is_tokenizers_available() else None),
         ("byt5", "ByT5Tokenizer"),
@@ -118,7 +120,7 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("fastspeech2_conformer", "FastSpeech2ConformerTokenizer" if is_g2p_en_available() else None),
         ("flaubert", "FlaubertTokenizer"),
         ("flava", "BertTokenizer" if is_tokenizers_available() else None),
-        ("flex_olmo", "GPT2Tokenizer" if is_tokenizers_available() else None),
+        ("flex_olmo", "TokenizersBackend" if is_tokenizers_available() else None),
         ("florence2", "BartTokenizer" if is_tokenizers_available() else None),
         ("fnet", "FNetTokenizer" if is_tokenizers_available() else None),
         ("fsmt", "FSMTTokenizer"),
@@ -141,7 +143,7 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("got_ocr2", "TokenizersBackend" if is_tokenizers_available() else None),
         ("gpt-sw3", "GPTSw3Tokenizer" if is_sentencepiece_available() else None),
         ("gpt2", "GPT2Tokenizer" if is_tokenizers_available() else None),
-        ("gpt_bigcode", "GPT2Tokenizer" if is_tokenizers_available() else None),
+        ("gpt_bigcode", "TokenizersBackend" if is_tokenizers_available() else None),
         ("gpt_neo", "GPT2Tokenizer" if is_tokenizers_available() else None),
         ("gpt_neox", "GPTNeoXTokenizer" if is_tokenizers_available() else None),
         ("gpt_neox_japanese", "GPTNeoXJapaneseTokenizer"),
@@ -157,12 +159,12 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("ibert", "RobertaTokenizer"),
         ("idefics", "LlamaTokenizer" if is_tokenizers_available() else None),
         ("idefics2", "LlamaTokenizer" if is_tokenizers_available() else None),
-        ("instructblip", "GPT2Tokenizer" if is_tokenizers_available() else None),
-        ("instructblipvideo", "GPT2Tokenizer" if is_tokenizers_available() else None),
+        ("instructblip", "TokenizersBackend" if is_tokenizers_available() else None),
+        ("instructblipvideo", "TokenizersBackend" if is_tokenizers_available() else None),
         ("internvl", "Qwen2Tokenizer" if is_tokenizers_available() else None),
         ("jais2", "GPT2Tokenizer" if is_tokenizers_available() else None),
         ("jina_embeddings_v3", "XLMRobertaTokenizer" if is_tokenizers_available() else None),
-        ("kosmos-2", "XLMRobertaTokenizer" if is_tokenizers_available() else None),
+        ("kosmos-2", "TokenizersBackend" if is_tokenizers_available() else None),
         ("lasr_ctc", "LasrTokenizer" if is_tokenizers_available() else None),
         ("lasr_encoder", "LasrTokenizer" if is_tokenizers_available() else None),
         ("layoutlm", "BertTokenizer" if is_tokenizers_available() else None),
@@ -233,9 +235,9 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("nllb-moe", "NllbTokenizer" if is_tokenizers_available() else None),
         ("nomic_bert", "BertTokenizer" if is_tokenizers_available() else None),
         ("nougat", "NougatTokenizer" if is_tokenizers_available() else None),
-        ("nystromformer", "AlbertTokenizer" if is_tokenizers_available() else None),
+        ("nystromformer", "TokenizersBackend" if is_tokenizers_available() else None),
         ("olmo", "GPTNeoXTokenizer" if is_tokenizers_available() else None),
-        ("olmo2", "GPTNeoXTokenizer" if is_tokenizers_available() else None),
+        ("olmo2", "TokenizersBackend" if is_tokenizers_available() else None),
         ("olmo3", "TokenizersBackend" if is_tokenizers_available() else None),
         ("olmo_hybrid", "TokenizersBackend" if is_tokenizers_available() else None),
         ("olmoe", "GPTNeoXTokenizer" if is_tokenizers_available() else None),
@@ -249,11 +251,12 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("parakeet_ctc", "ParakeetTokenizer" if is_tokenizers_available() else None),
         ("parakeet_tdt", "ParakeetTokenizer" if is_tokenizers_available() else None),
         ("pegasus", "PegasusTokenizer" if is_tokenizers_available() else None),
-        ("pegasus_x", "PegasusTokenizer" if is_tokenizers_available() else None),
+        ("pegasus_x", "TokenizersBackend" if is_tokenizers_available() else None),
         ("perceiver", "PerceiverTokenizer"),
+        ("persimmon", "TokenizersBackend" if is_tokenizers_available() else None),
         ("phi", "GPT2Tokenizer" if is_tokenizers_available() else None),
         ("phobert", "PhobertTokenizer"),
-        ("pix2struct", "T5Tokenizer" if is_tokenizers_available() else None),
+        ("pix2struct", "TokenizersBackend" if is_tokenizers_available() else None),
         (
             "pixtral",
             "MistralCommonBackend"
@@ -301,7 +304,7 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("speecht5", "SpeechT5Tokenizer" if is_sentencepiece_available() else None),
         ("splinter", "SplinterTokenizer"),
         ("squeezebert", "BertTokenizer" if is_tokenizers_available() else None),
-        ("stablelm", "GPTNeoXTokenizer" if is_tokenizers_available() else None),
+        ("stablelm", "TokenizersBackend" if is_tokenizers_available() else None),
         ("starcoder2", "GPT2Tokenizer" if is_tokenizers_available() else None),
         ("switch_transformers", "T5Tokenizer" if is_tokenizers_available() else None),
         ("t5", "T5Tokenizer" if is_tokenizers_available() else None),
@@ -310,7 +313,7 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("trocr", "XLMRobertaTokenizer" if is_tokenizers_available() else None),
         ("tvp", "BertTokenizer" if is_tokenizers_available() else None),
         ("udop", "UdopTokenizer" if is_tokenizers_available() else None),
-        ("umt5", "T5Tokenizer" if is_tokenizers_available() else None),
+        ("umt5", "TokenizersBackend" if is_tokenizers_available() else None),
         ("unispeech", "Wav2Vec2CTCTokenizer"),
         ("unispeech-sat", "Wav2Vec2CTCTokenizer"),
         ("vilt", "BertTokenizer" if is_tokenizers_available() else None),
@@ -337,7 +340,7 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, str | None](
         ("xglm", "XGLMTokenizer" if is_tokenizers_available() else None),
         ("xlm", "XLMTokenizer"),
         ("xlm-roberta", "XLMRobertaTokenizer" if is_tokenizers_available() else None),
-        ("xlm-roberta-xl", "XLMRobertaTokenizer" if is_tokenizers_available() else None),
+        ("xlm-roberta-xl", "TokenizersBackend" if is_tokenizers_available() else None),
         ("xlnet", "XLNetTokenizer" if is_tokenizers_available() else None),
         ("xlstm", "GPTNeoXTokenizer" if is_tokenizers_available() else None),
         ("xmod", "XLMRobertaTokenizer" if is_tokenizers_available() else None),
@@ -359,8 +362,11 @@ MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS: set[str] = {
     "deepseek_vl_v2",
     "deepseek_ocr",
     "deepseek_ocr2",
+    "ernie4_5",
+    "ernie4_5_moe",
     "fuyu",
     "h2ovl_chat",
+    "hyperclovax",
     "hyperclovax_vlm",
     "internlm2",
     "internvl_chat",
@@ -377,6 +383,7 @@ MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS: set[str] = {
     "nvfp4",
     "opencua",
     "openvla",
+    "paddleocr_vl",
     "phi3",
     "phi3_v",
     "phimoe",
@@ -385,6 +392,9 @@ MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS: set[str] = {
     "step3_vl",
     "vipllava",
     "cohere_asr",
+    "camembertv2-base",
+    "smolvlm",
+    "vision-encoder-decoder",
 }
 
 for model_type in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS:
@@ -698,6 +708,7 @@ class AutoTokenizer:
                 config = PreTrainedConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
         config_model_type = config.model_type
+        config_model_name = config.model_name if hasattr(config, "model_name") else None
 
         # Next, let's try to use the tokenizer_config file to get the tokenizer class.
         tokenizer_config = get_tokenizer_config(pretrained_model_name_or_path, **kwargs)
@@ -712,24 +723,43 @@ class AutoTokenizer:
             else:
                 tokenizer_auto_map = tokenizer_config["auto_map"].get("AutoTokenizer", None)
 
-        # if there is a config, we can check that the tokenizer class != than model class.
-        # Use the config class if it's a specialized tokenizer, otherwise fall back to TokenizersBackend.
+        # deepseek-r1 distills use model_type="llama" and tokenizer_class="LlamaTokenizer" but need TokenizersBackend. Hub really needs to be updated
+        _config_name_or_path = (getattr(config, "_name_or_path", None) or "").lower()
         if (
             tokenizer_auto_map is None
-            and tokenizer_config_class is not None
+            and TokenizersBackend is not None
+            and _config_name_or_path.startswith("deepseek-ai/deepseek-r1")
+        ):
+            return TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
+
+        # if there is a config, we can check that the tokenizer class != than model class.
+        # Use the config class if it's a specialized tokenizer, otherwise fall back to TokenizersBackend.
+        # Hub class should prioritize tokenizer_config.json or fallback to config.tokenizer_class.
+        _hub_class = tokenizer_config_class or getattr(config, "tokenizer_class", None)
+        if (
+            tokenizer_auto_map is None
+            and _hub_class is not None
             and config_model_type is not None
             and config_model_type != ""
             and TOKENIZER_MAPPING_NAMES.get(config_model_type) is not None
             and (TOKENIZER_MAPPING_NAMES.get(config_model_type).removesuffix("Fast"))
-            != (tokenizer_config_class.removesuffix("Fast"))
+            != (_hub_class.removesuffix("Fast"))
         ):
             registered_class_name = TOKENIZER_MAPPING_NAMES.get(config_model_type).removesuffix("Fast")
-            if registered_class_name not in ("TokenizersBackend", "PythonBackend", "PreTrainedTokenizerFast"):
+            if registered_class_name not in (
+                "TokenizersBackend",
+                "PythonBackend",
+                "PreTrainedTokenizerFast",
+                "MistralCommonBackend",
+            ):
                 # If the hub class is known incorrect for this model type, use the registered class; otherwise trust the hub.
                 class_name = (
                     registered_class_name
-                    if config_model_type in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS
-                    else tokenizer_config_class
+                    if (
+                        config_model_type in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS
+                        or config_model_name in MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS
+                    )
+                    else _hub_class
                 )
                 tokenizer_class = tokenizer_class_from_name(class_name)
                 if tokenizer_class is not None and tokenizer_class.__name__ not in (
@@ -743,7 +773,7 @@ class AutoTokenizer:
                 return TokenizersBackend.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
 
             raise ValueError(
-                f"Tokenizer class '{tokenizer_config_class}' specified in the tokenizer config was not found. "
+                f"Tokenizer class '{_hub_class}' specified in the tokenizer config was not found. "
                 f"The tokenizer may need to be converted or re-saved."
             )
 
