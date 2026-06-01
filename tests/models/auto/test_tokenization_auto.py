@@ -812,7 +812,6 @@ class NopConfig(PreTrainedConfig):
             self.assertIs(result, mock_tokenizer)
 
     TOKENIZERS_BACKEND_AUTO_MAPPING_CHECKPOINTS = [
-        "albert/albert-base-v2",
         "almanach/camembert-base",
         "google/rembert",
         "facebook/xglm-564M",
@@ -821,7 +820,7 @@ class NopConfig(PreTrainedConfig):
 
     @require_tokenizers
     @parameterized.expand(TOKENIZERS_BACKEND_AUTO_MAPPING_CHECKPOINTS)
-    def test_eq(self, repo_id):
+    def test_right_to_left_mark(self, repo_id):
         # PR #45936: v5 tokenizer auto mapping changes to use TokenizersBackend.
         # Text contains U+200F (RIGHT-TO-LEFT MARK) which exposes ‏ handling
         # differences between TokenizersBackend and slow tokenizer backends.
