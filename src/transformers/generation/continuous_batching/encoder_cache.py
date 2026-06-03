@@ -18,6 +18,8 @@ from itertools import repeat
 
 import torch
 
+from ...configuration_utils import PretrainedConfig
+from ...generation.configuration_utils import ContinuousBatchingConfig
 from .requests import RequestState
 
 
@@ -29,25 +31,25 @@ class EncoderCache:
 
     def __init__(
         self,
-        max_batch_tokens: int,
-        hidden_size: int,
-        image_token_id: int,
+        config: PretrainedConfig,
+        continuous_batching_config: ContinuousBatchingConfig,
         model_dtype: torch.dtype,
         device: torch.device,
     ) -> None:
+        self.use_async_batching = continuous_batching_config.use_async_batching
         # Create the actual cache tensor
-        cache_size = max(16384, max_batch_tokens)
-        cache_shape = (cache_size, hidden_size)
+        cache_size = max(16384, continuous_batching_config.max_batch_tokens)
+        cache_shape = (cache_size, config.hidden_size)
         self.cache = torch.empty(cache_shape, dtype=model_dtype, device=device)
         # Create bookkeeping data structures
         self.free_blocks = deque(range(cache_size))
-        self.allocated_blocks: dict[str, torch.Tensor] = {}
+        self.allocated_blocks_masks: dict[str, torch.Tensor] = {}
         self.embeddings_lengths: dict[str, int] = {}
         self.outgoing_requests: list[str] = [] # TODO: BUG: this is not used, it needs to be called when the batch is done
         # Keep track of the image token id
-        if not isinstance(image_token_id, int) or image_token_id <= 0:
-            raise ValueError(f"Image token ID must be a positive integer but got {image_token_id = }")
-        self.image_token_id = image_token_id
+        self.image_token_id = config.image_token_id
+        if not isinstance(self.image_token_id, int) or self.image_token_id <= 0:
+            raise ValueError(f"Image token ID must be a positive integer but got {self.image_token_id = }")
 
     def can_store_mm_embeddings(self, state: RequestState) -> bool:
         """Checks if there is enough space in the encoder cache to store the multimodal embeddings."""
@@ -69,7 +71,7 @@ class EncoderCache:
         img_mask = (input_ids == self.image_token_id)
         input_ids.fill_(-1)
         input_ids[img_mask] = torch.tensor(allocated_blocks, device="cpu", dtype=torch.int32)
-        self.allocated_blocks[state.request_id] = input_ids
+        self.allocated_blocks_masks[state.request_id] = input_ids
         # TODO: this could be optimized by truncating from the first and last img tokens
 
     def extend_read_indices(
@@ -90,7 +92,7 @@ class EncoderCache:
 
         and the function will return True because there are actual cache reads (block 0, 1 and 3 are read).
         """
-        block_table = self.allocated_blocks.get(request_id)
+        block_table = self.allocated_blocks_masks.get(request_id)
         # Only compute read indices if the request has allocated blocks
         if block_table is not None:
             intersection = block_table[past_length:past_length + query_length].tolist()
@@ -112,7 +114,7 @@ class EncoderCache:
     def store_mm_embeddings(self, request_id: str, image_features: torch.Tensor) -> None:
         """Stores the multimodal embeddings for a request in the encoder cache."""
         # Retrieve the allocated blocks mask for the request
-        allocated_blocks_mask = self.allocated_blocks.get(request_id)
+        allocated_blocks_mask = self.allocated_blocks_masks.get(request_id)
         if allocated_blocks_mask is None:
             raise ValueError(f"Request {request_id} has no allocated blocks mask")
         # Extract the allocated blocks from the mask
@@ -120,3 +122,17 @@ class EncoderCache:
         allocated_blocks = allocated_blocks_mask[mask].to(self.cache.device)
         # Store the multimodal embeddings in the cache
         self.cache[allocated_blocks] = image_features
+
+    def release_outgoing_requests(self) -> None:
+        """Releases the outgoing requests from the encoder cache."""
+        # Loop until there are no outgoing requests
+        while self.outgoing_requests:
+            request_id = self.outgoing_requests.pop()
+            # Retrieve the list of blocks to free
+            allocated_blocks_mask = self.allocated_blocks_masks.pop(request_id, None)
+            if allocated_blocks_mask is None and not self.use_async_batching:  # impossible in sync mode
+                raise ValueError(f"Cannot release {request_id} because it has no allocated blocks mask")
+            mask = allocated_blocks_mask != -1
+            blocks_to_free = allocated_blocks_mask[mask].tolist()
+            # Actually free the blocks
+            self.free_blocks.extend(blocks_to_free)

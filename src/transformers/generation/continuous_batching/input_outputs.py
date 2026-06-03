@@ -437,11 +437,11 @@ class ContinuousBatchingIOs:
                 self.req_id_to_new_token_position[state.request_id] = logits_indices[-1]
 
             # If the request is an encoder request, we accumulate the encoder arguments
-            if state.multimodal_data:
-                mm_data = state.multimodal_data
+            if state.multimodal_inputs:
+                mm_data = state.multimodal_inputs
                 mm_data[self.encoder_cache.REQUEST_ID_KEY] = state.request_id  # type: ignore (was already checked)
                 self.encoder_kwargs.append(mm_data)
-                state.multimodal_data = {}  # means there was multimodal data and it has already been processed
+                state.multimodal_inputs = {}  # means there was multimodal data and it has already been processed
 
             self.requests_in_batch.append(future_state)
 

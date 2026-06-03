@@ -452,6 +452,10 @@ class ContinuousBatchProcessor:
         if pending_outputs:
             self.output_router.deliver_batch(pending_outputs)
 
+        # If there are outgoing requests in the encoder cache, we release them now
+        if self.encoder_cache is not None:
+            self.encoder_cache.release_outgoing_requests()
+
         # If some requests need to be forked, we do it now
         copy_source, copy_destination = [], []
         while self.scheduler._requests_to_fork:
@@ -720,6 +724,7 @@ class ContinuousBatchingManager:
     def add_request(
         self,
         input_ids: list[int],
+        multimodal_inputs: dict[str, Any] | None = None,
         request_id: str | None = None,
         max_new_tokens: int | None = None,
         streaming: bool = False,
@@ -731,6 +736,7 @@ class ContinuousBatchingManager:
 
         Args:
             input_ids: Input token IDs to use as prompt
+            multimodal_inputs: Multimodal inputs returned by the processor. Tensors are assumed to be device-side.
             request_id: Optional custom request ID (auto-generated if None)
             max_new_tokens: Maximum number of new tokens to generate
             streaming: Whether to stream tokens as they're generated
@@ -761,6 +767,7 @@ class ContinuousBatchingManager:
         state = RequestState(
             request_id=request_id,
             initial_tokens=list(input_ids),
+            multimodal_inputs=multimodal_inputs,
             num_children=self.num_return_sequences - 1,
             record_timestamps=record_timestamps,
             max_new_tokens=max_new_tokens,
@@ -777,6 +784,7 @@ class ContinuousBatchingManager:
     def add_requests(
         self,
         inputs: list[list[int]],
+        multimodal_inputs: list[dict[str, Any] | None] | None = None,
         max_new_tokens: int | None = None,
         streaming: bool = False,
         record_timestamps: bool = False,
@@ -797,9 +805,12 @@ class ContinuousBatchingManager:
         eos_token_id = self.model.config.eos_token_id if eos_token_id is None else eos_token_id
         eos_token_id = -1 if eos_token_id is None else eos_token_id
         # Add requests in order
-        for request_id, input_ids in ids_and_inputs:
+        if multimodal_inputs is None:
+            multimodal_inputs = [None] * num_requests
+        for request_id, input_ids, multimodal_input in zip(ids_and_inputs, inputs, multimodal_inputs):
             self.add_request(
                 input_ids=input_ids,
+                multimodal_inputs=multimodal_input,
                 request_id=request_id,
                 max_new_tokens=max_new_tokens,
                 streaming=streaming,
@@ -970,9 +981,8 @@ class ContinuousBatchingManager:
         # Create the encoder cache if needed
         if encoder_cache_needed:
             encoder_cache = EncoderCache(
-                max_batch_tokens=paged_attention_cache.max_batch_tokens,
-                hidden_size=self.model.config.hidden_size,
-                image_token_id=self.model.config.image_token_id,
+                config=self.model.config,
+                continuous_batching_config=self.continuous_batching_config,
                 model_dtype=self.model.dtype,
                 device=self.model.device,
             )
@@ -1156,6 +1166,7 @@ class ContinuousMixin:
     def generate_batch(
         self,
         inputs: list[list[int]],
+        multimodal_inputs: list[dict[str, Any] | None] | None = None,
         generation_config: GenerationConfig | None = None,
         continuous_batching_config: ContinuousBatchingConfig | None = None,
         record_timestamps: bool = False,
@@ -1168,6 +1179,7 @@ class ContinuousMixin:
 
         Args:
             inputs: List of input token sequences (prompts)
+            multimodal_inputs: List of multimodal inputs returned by the processor. Tensors are assumed to be device-side.
             generation_config: Optional generation configuration
             continuous_batching_config: Optional continuous batching configuration
             record_timestamps: If set to true, the requests will have a timestamp for each token generated
@@ -1225,7 +1237,10 @@ class ContinuousMixin:
         with manager_cm as manager, logging_cm, pbar_cm as pbar:
             try:
                 request_ids = manager.add_requests(
-                    inputs=inputs, max_new_tokens=max_new_tokens, record_timestamps=record_timestamps
+                    inputs=inputs,
+                    multimodal_inputs=multimodal_inputs,
+                    max_new_tokens=max_new_tokens,
+                    record_timestamps=record_timestamps
                 )
                 while finished_count < num_requests:
                     result = manager.get_result(timeout=1)

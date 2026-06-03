@@ -233,7 +233,7 @@ class Scheduler(ABC):
                 break
 
             # Check if there is enough space in the encoder cache (performed first because very cheap)
-            if state.multimodal_data and not self._can_store_mm_embeddings(state):
+            if state.multimodal_inputs and not self._can_store_mm_embeddings(state):
                 continue
 
             # Infer the tokens that will be present in the batch if token budget is enough
@@ -270,7 +270,7 @@ class Scheduler(ABC):
             request_len = len(state.tokens_to_process)  # it may change after scheduling
 
             # If the request has multimodal data to process, we allocate space in the encoder cache
-            if state.multimodal_data:
+            if state.multimodal_inputs:
                 if self.encoder_cache is None:
                     raise ValueError(f"Request has multimodal data but there is no encoder cache: {state = }")
                 self.encoder_cache.allocate_blocks(state)

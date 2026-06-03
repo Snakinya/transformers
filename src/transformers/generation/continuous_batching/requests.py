@@ -147,7 +147,7 @@ class RequestState:
     request_id: str
     initial_tokens: list[int]  # Initial prompt tokens # TODO: rename this as prefill tokens
     # This field is None for text-only requests. For MM requests, the dict is emptied once the embeddings are computed
-    multimodal_data: dict | None = None
+    multimodal_inputs: dict | None = None
 
     # Optional fields (CB parameters)
     streaming: bool = False  # Whether to stream tokens as they're generated
