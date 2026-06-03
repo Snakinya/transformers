@@ -796,8 +796,11 @@ class ContinuousBatchingManager:
         with self._request_lock:
             request_ids = [f"req_{i}" for i in range(self._request_counter, self._request_counter + num_requests)]
             self._request_counter += num_requests
+        # Broadcast the multimodal inputs if they are set to None
+        if multimodal_inputs is None:
+            multimodal_inputs = [None] * num_requests
         # If there is prefix sharing, we sort the inputs to maximize cache hits but keep the order of the requests
-        ids_and_inputs = list(zip(request_ids, inputs))
+        ids_and_inputs = list(zip(request_ids, inputs, multimodal_inputs))
         if self._use_prefix_sharing:
             ids_and_inputs = sorted(ids_and_inputs, key=lambda x: x[1], reverse=True)
         # EOS determination order: generation config -> model config -> -1 (no EOS)
@@ -805,9 +808,7 @@ class ContinuousBatchingManager:
         eos_token_id = self.model.config.eos_token_id if eos_token_id is None else eos_token_id
         eos_token_id = -1 if eos_token_id is None else eos_token_id
         # Add requests in order
-        if multimodal_inputs is None:
-            multimodal_inputs = [None] * num_requests
-        for request_id, input_ids, multimodal_input in zip(ids_and_inputs, inputs, multimodal_inputs):
+        for request_id, input_ids, multimodal_input in ids_and_inputs:
             self.add_request(
                 input_ids=input_ids,
                 multimodal_inputs=multimodal_input,
@@ -966,23 +967,24 @@ class ContinuousBatchingManager:
             return batch_processor
 
         # Create the paged attention cache (for KV) and maybe an encoder cache (for multimodal embeddings)
-        encoder_cache_needed = check_modality_support(self.model.input_modalities)
+        is_multimodal_model = check_modality_support(self.model.input_modalities)
         # The KV cache is dimensionned to take the encoder cache into account if there is one
         paged_attention_cache = PagedAttentionCache(
             config=self.model.config,
             continuous_batching_config=self.continuous_batching_config,
+            is_multimodal_model=is_multimodal_model,
             device=self.model.device,
+            dtype=self.model.dtype,
             distributed_helper=self.distributed_helper,
             tp_plan=getattr(self.model, "tp_plan", {}),
-            encoder_cache_needed=encoder_cache_needed,
-            dtype=self.model.dtype,
         )
         self._use_prefix_sharing = paged_attention_cache.use_prefix_sharing  # update the approximation
         # Create the encoder cache if needed
-        if encoder_cache_needed:
+        if is_multimodal_model:
             encoder_cache = EncoderCache(
                 config=self.model.config,
-                continuous_batching_config=self.continuous_batching_config,
+                max_batch_tokens=paged_attention_cache.max_batch_tokens,
+                use_async_batching=self.continuous_batching_config.use_async_batching,
                 model_dtype=self.model.dtype,
                 device=self.model.device,
             )

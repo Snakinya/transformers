@@ -32,7 +32,7 @@ class Scheduler(ABC):
         self.encoder_cache = encoder_cache
         self._cancellation_lock = threading.Lock()
         # This is to compute the read cache used by a new request being scheduled
-        self.read_cache_limit = None if self.cache.num_full_attention_groups else self.cache.config.sliding_window
+        self.read_cache_limit = None if self.cache.num_full_attention_groups else self.cache.max_sliding_window
         self.max_decode_fast_path_length = self.cache.max_blocks_per_request * self.cache.block_size
         # Initialize mutable states via reset()
         self.reset()

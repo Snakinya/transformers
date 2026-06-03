@@ -110,7 +110,10 @@ class ModelRunner:
                 encoder_kw["return_dict"] = True
                 request_id = encoder_kw.pop(self.encoder_cache.REQUEST_ID_KEY)
                 image_features_tuple = model.get_image_features(**encoder_kw).pooler_output
-                image_features = torch.cat(image_features_tuple, dim=0)
+                if isinstance(image_features_tuple, tuple):
+                    image_features = torch.cat(image_features_tuple, dim=0)
+                else:
+                    image_features = image_features_tuple
                 self.encoder_cache.store_mm_embeddings(request_id, image_features)
 
 

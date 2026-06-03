@@ -72,6 +72,39 @@ def attn_mask_is_needed(config: PretrainedConfig) -> bool:
     """Checks if attention mask is needed for the given (config)."""
     return config._attn_implementation in ["paged|eager", "paged|sdpa"]
 
+def _get_num_kv_heads(config: PretrainedConfig) -> int | None:
+    """Finds the number of key-value heads for the given config."""
+    for attr in ["num_key_value_heads", "num_attention_heads"]:
+        if hasattr(config, attr):
+            return getattr(config, attr)
+    return None
+
+def find_num_kv_heads(config: PretrainedConfig, is_multimodal_model: bool) -> int | None:
+    num_kv_heads = _get_num_kv_heads(config)
+    if num_kv_heads is None and is_multimodal_model:
+        num_kv_heads = _get_num_kv_heads(config.text_config)
+    if num_kv_heads is None:
+        raise ValueError(f"num_key_value_heads could not be found in the config:\n{config}")
+    return num_kv_heads
+
+
+def _get_head_dim(config: PretrainedConfig) -> int | None:
+    """Finds the head dimension for the given config."""
+    if hasattr(config, "head_dim"):
+        return config.head_dim
+    if hasattr(config, "hidden_size") and hasattr(config, "num_attention_heads"):
+        return config.hidden_size // config.num_attention_heads
+    return None
+
+
+def find_head_dim(config: PretrainedConfig, is_multimodal_model: bool) -> int | None:
+    head_dim = _get_head_dim(config)
+    if head_dim is None and is_multimodal_model:
+        head_dim = _get_head_dim(config.text_config)
+    if head_dim is None:
+        raise ValueError(f"head_dim could not be found in the config:\n{config}")
+    return head_dim
+
 
 def pad_to_interval(size: int, interval_size: int, max_value: int) -> int:
     """Return the smallest multiple of (interval_size) >= (size), capped at (max_value)."""

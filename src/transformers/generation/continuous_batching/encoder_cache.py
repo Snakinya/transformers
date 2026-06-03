@@ -32,24 +32,24 @@ class EncoderCache:
     def __init__(
         self,
         config: PretrainedConfig,
-        continuous_batching_config: ContinuousBatchingConfig,
+        max_batch_tokens: int,
+        use_async_batching: bool,
         model_dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self.use_async_batching = continuous_batching_config.use_async_batching
+        self.use_async_batching = use_async_batching
+        self.image_token_id = config.image_token_id
+        if not isinstance(self.image_token_id, int) or self.image_token_id <= 0:
+            raise ValueError(f"Image token ID must be a positive integer but got {self.image_token_id = }")
         # Create the actual cache tensor
-        cache_size = max(16384, continuous_batching_config.max_batch_tokens)
-        cache_shape = (cache_size, config.hidden_size)
+        cache_size = max(16384, max_batch_tokens)
+        cache_shape = (cache_size, config.text_config.hidden_size)
         self.cache = torch.empty(cache_shape, dtype=model_dtype, device=device)
         # Create bookkeeping data structures
         self.free_blocks = deque(range(cache_size))
         self.allocated_blocks_masks: dict[str, torch.Tensor] = {}
         self.embeddings_lengths: dict[str, int] = {}
         self.outgoing_requests: list[str] = [] # TODO: BUG: this is not used, it needs to be called when the batch is done
-        # Keep track of the image token id
-        self.image_token_id = config.image_token_id
-        if not isinstance(self.image_token_id, int) or self.image_token_id <= 0:
-            raise ValueError(f"Image token ID must be a positive integer but got {self.image_token_id = }")
 
     def can_store_mm_embeddings(self, state: RequestState) -> bool:
         """Checks if there is enough space in the encoder cache to store the multimodal embeddings."""
