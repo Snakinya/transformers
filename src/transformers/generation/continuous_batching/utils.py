@@ -180,11 +180,12 @@ def build_attention_mask(
         attention_mask[..., query_range, key_range] = masked
 
 
-def check_modality_support(input_modalities: list[str]) -> bool:
+def check_modality_support(input_modalities: str | list[str]) -> bool:
     """Check if CB supports the given input modalities and returns True if the model is multimodal."""
+    input_modalities = [input_modalities] if isinstance(input_modalities, str) else input_modalities
 
     # Raise an error if the model supports no modalities in CB's supported set
-    supported_modalities = set(input_modalities).union({"text", "image"})
+    supported_modalities = set(input_modalities).intersection({"text", "image"})
     if len(supported_modalities) == 0:
         raise ValueError(f"This model supports {input_modalities = } but CB only supports text and image.")
 

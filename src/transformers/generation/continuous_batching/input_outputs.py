@@ -91,7 +91,7 @@ class ContinuousBatchingIOs:
         return_logprobs: bool,
         logit_processor: ContinuousBatchingLogitsProcessorList,
         use_cuda_graph_varlen: bool,
-        allocate_inputs_embeds: bool = True,
+        _use_inputs_embeds: bool | None = None,
     ) -> None:
         """Initialize the continuous batching I/O manager. Args:
         - cache: The [`PagedAttentionCache`] instance managing the KV cache. Meant to be unique.
@@ -102,7 +102,7 @@ class ContinuousBatchingIOs:
         - return_logprobs: Whether to return log probabilities along with the token IDs.
         - logit_processor: The [`ContinuousBatchingLogitsProcessorList`] object used to process the logits.
         - use_cuda_graph_varlen: Whether CUDA graphs are enabled for the varlen (prefill) path.
-        - allocate_inputs_embeds: Whether to allocate an input embeddings tensor. If None, auto-inferred.
+        - _use_inputs_embeds: Whether to use an input embeddings tensor. If None, auto-inferred.
         """
         # Memoize attributes
         self.cache = cache
@@ -129,12 +129,13 @@ class ContinuousBatchingIOs:
         self.graphs: CudaGraphBuffer = CudaGraphBuffer(max_graphs)
         self._trash_index = cache.trash_index
         # Setup static tensors and compute stream
-        self._setup_static_tensors(logit_processor=logit_processor, allocate_inputs_embeds=allocate_inputs_embeds)
+        _use_inputs_embeds = (encoder_cache is not None) if _use_inputs_embeds is None else _use_inputs_embeds
+        self._setup_static_tensors(logit_processor=logit_processor, use_inputs_embeds=_use_inputs_embeds)
         self._reset_static_tensors(full_reset=True)
         self.compute_stream = torch.cuda.Stream(device=self.device) if device.type == "cuda" else None
 
     def _setup_static_tensors(
-        self, logit_processor: ContinuousBatchingLogitsProcessorList, allocate_inputs_embeds: bool
+        self, logit_processor: ContinuousBatchingLogitsProcessorList, use_inputs_embeds: bool
     ) -> None:
         """Allocates static tensors for generation inputs and outputs. This is called only once at init time, to avoid
         repeated allocations and enable CUDA graphs. All tensors are allocated with maximum possible sizes.
@@ -183,7 +184,7 @@ class ContinuousBatchingIOs:
             self.cumulative_seqlens_k["sliding_attention"] = sliding_attention_cumulative_seqlens_k
 
         # If allocated, the input embeddings tensor is not part of the bulk tensor, because it is device-resident
-        if allocate_inputs_embeds:
+        if use_inputs_embeds:
             self.inputs_embeds = torch.empty(
                 (max_batch_tokens, self.config.hidden_size), dtype=self.model_dtype, device=self.device,
             )
@@ -459,6 +460,7 @@ class ContinuousBatchingIOs:
         self.position_ids[: len(position_ids)] = to_tensor(position_ids)
         self.cumulative_seqlens_q[: len(cumulative_seqlens_q)] = to_tensor(cumulative_seqlens_q)
         self.logits_indices[: len(logits_indices)] = to_tensor(logits_indices)
+        self.encoder_cache_read_index[: len(encoder_cache_read_index)] = to_tensor(encoder_cache_read_index)
         self.total_seqlen_q = cumulative_seqlens_q[-1]
 
         # Those kwargs are either dict of tensors or tensors, so we need to handle both cases
@@ -609,7 +611,7 @@ class HostDeviceIOPair:
             return_logprobs=return_logprobs,
             logit_processor=logit_processor,
             use_cuda_graph_varlen=use_cuda_graph_varlen,
-            allocate_inputs_embeds=False,  # never needed on the CPU side
+            _use_inputs_embeds=False,  # never needed on the CPU side
         )
         self.device_io = ContinuousBatchingIOs(
             cache=cache,
@@ -621,7 +623,7 @@ class HostDeviceIOPair:
             return_logprobs=return_logprobs,
             logit_processor=logit_processor,
             use_cuda_graph_varlen=use_cuda_graph_varlen,
-            allocate_inputs_embeds=True,
+            _use_inputs_embeds=True,
         )
         # Create events only on CUDA devices
         self.h2d_over = torch.cuda.Event() if torch.cuda.is_available() else None

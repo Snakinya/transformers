@@ -109,7 +109,8 @@ class ModelRunner:
             for encoder_kw in encoder_kwargs:
                 encoder_kw["return_dict"] = True
                 request_id = encoder_kw.pop(self.encoder_cache.REQUEST_ID_KEY)
-                image_features = model.get_image_features(**encoder_kw).pooler_output
+                image_features_tuple = model.get_image_features(**encoder_kw).pooler_output
+                image_features = torch.cat(image_features_tuple, dim=0)
                 self.encoder_cache.store_mm_embeddings(request_id, image_features)
 
 
@@ -118,7 +119,8 @@ class ModelRunner:
         # Run the embedding layer to get all text tokens embeddings
         input_ids = batch_data["input_ids"]
         inputs_embeds: torch.Tensor = batch_data["inputs_embeds"]  # shape [1, q_tokens, hidden_size]
-        inputs_embeds.copy_(model.embed_tokens(input_ids))
+        embedding_module = model.get_input_embeddings()
+        inputs_embeds.copy_(embedding_module(input_ids))
         # If there are no multimodal embeddings to incorporate, we can return early
         mm_embeddings_read_index = batch_data.get("encoder_cache_read_index")  # shape [q_tokens] or None
         if mm_embeddings_read_index is None:
@@ -127,7 +129,7 @@ class ModelRunner:
         mm_embeddings = self.encoder_cache.cache[mm_embeddings_read_index] # shape [q_tokens, hidden_size]
         mm_embeddings = mm_embeddings.unsqueeze(0)  # shape [1, q_tokens, hidden_size]
         mask = (mm_embeddings_read_index == -1).unsqueeze(-1)  # shape [1, q_tokens]
-        inputs_embeds.where_(mask, mm_embeddings)
+        inputs_embeds.copy_(torch.where(mask, inputs_embeds, mm_embeddings))
 
 
     def compute_batch(self, model: nn.Module, batch_data: PagedAttentionArgs) -> None:
@@ -139,9 +141,11 @@ class ModelRunner:
         # This is the stream on which the compute happens
         compute_stream = self.inputs_and_outputs.compute_stream
 
+        # TODO; BUG: carry over needs to happen here, before the embeddings are filled
         if batch_data["inputs_embeds"] is not None:
             with self.compute_stream_ctx():
                 self.fill_inputs_embeds(model, batch_data)
+            batch_data["input_ids"] = None  # now that the inputs_embeds are filled, we can remove the input_ids
 
         # Get the appropriate forward function (compiled or not, based on current path)
         forward_fn, use_cuda_graph = self._get_forward_fn(use_block_table=self.inputs_and_outputs.use_block_table)

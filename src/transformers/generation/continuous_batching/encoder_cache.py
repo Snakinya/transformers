@@ -43,7 +43,7 @@ class EncoderCache:
         self.free_blocks = deque(range(cache_size))
         self.allocated_blocks: dict[str, torch.Tensor] = {}
         self.embeddings_lengths: dict[str, int] = {}
-        self.outgoing_requests: list[str] = []
+        self.outgoing_requests: list[str] = [] # TODO: BUG: this is not used, it needs to be called when the batch is done
         # Keep track of the image token id
         if not isinstance(image_token_id, int) or image_token_id <= 0:
             raise ValueError(f"Image token ID must be a positive integer but got {image_token_id = }")
