@@ -146,8 +146,8 @@ class PagedAttentionCache:
         llm_config = config.text_config if is_multimodal_model and hasattr(config, "text_config") else config
 
         # Extract model dimensions
-        self.num_key_value_heads = find_num_kv_heads(llm_config, is_multimodal_model)
-        self.head_dim = find_head_dim(llm_config, is_multimodal_model)
+        self.num_key_value_heads = find_num_kv_heads(llm_config)
+        self.head_dim = find_head_dim(llm_config)
 
         # Extract cache dimensions. Default used to be 32, now it's 256 to be compatible with flash_with_kvcache.
         self.block_size = continuous_batching_config.block_size

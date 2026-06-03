@@ -19,7 +19,6 @@ from itertools import repeat
 import torch
 
 from ...configuration_utils import PretrainedConfig
-from ...generation.configuration_utils import ContinuousBatchingConfig
 from .requests import RequestState
 
 
@@ -49,7 +48,7 @@ class EncoderCache:
         self.free_blocks = deque(range(cache_size))
         self.allocated_blocks_masks: dict[str, torch.Tensor] = {}
         self.embeddings_lengths: dict[str, int] = {}
-        self.outgoing_requests: list[str] = [] # TODO: BUG: this is not used, it needs to be called when the batch is done
+        self.outgoing_requests: set[str] = set()
 
     def can_store_mm_embeddings(self, state: RequestState) -> bool:
         """Checks if there is enough space in the encoder cache to store the multimodal embeddings."""
@@ -101,7 +100,7 @@ class EncoderCache:
             cache_read = (block_table[past_length:past_length + query_length] != -1).any().item()
             # Check if all the multimodal embeddings for this request have been read
             if past_length + query_length >= len(block_table):
-                self.outgoing_requests.append(request_id)
+                self.outgoing_requests.add(request_id)
         else:
             intersection = []
             missing_indices = query_length
@@ -130,7 +129,9 @@ class EncoderCache:
             request_id = self.outgoing_requests.pop()
             # Retrieve the list of blocks to free
             allocated_blocks_mask = self.allocated_blocks_masks.pop(request_id, None)
-            if allocated_blocks_mask is None and not self.use_async_batching:  # impossible in sync mode
+            if allocated_blocks_mask is None:
+                if self.use_async_batching:
+                    continue
                 raise ValueError(f"Cannot release {request_id} because it has no allocated blocks mask")
             mask = allocated_blocks_mask != -1
             blocks_to_free = allocated_blocks_mask[mask].tolist()

@@ -110,10 +110,10 @@ class ModelRunner:
                 encoder_kw["return_dict"] = True
                 request_id = encoder_kw.pop(self.encoder_cache.REQUEST_ID_KEY)
                 image_features_tuple = model.get_image_features(**encoder_kw).pooler_output
-                if isinstance(image_features_tuple, tuple):
-                    image_features = torch.cat(image_features_tuple, dim=0)
-                else:
+                if isinstance(image_features_tuple, torch.Tensor):
                     image_features = image_features_tuple
+                else:
+                    image_features = torch.cat(image_features_tuple, dim=0)
                 self.encoder_cache.store_mm_embeddings(request_id, image_features)
 
 
@@ -135,6 +135,13 @@ class ModelRunner:
         inputs_embeds.copy_(torch.where(mask, inputs_embeds, mm_embeddings))
 
 
+    def _pop_or_get_input_ids(self, batch_data: PagedAttentionArgs) -> torch.Tensor:
+        """Retrieves the input ids from the batch data, popping it if the inputs_embeds are present."""
+        if batch_data["inputs_embeds"] is not None:
+            return batch_data.pop("input_ids")
+        return batch_data["input_ids"]
+
+
     def compute_batch(self, model: nn.Module, batch_data: PagedAttentionArgs) -> None:
         """Runs the forward pass, processes the logits and samples the next tokens. It also handles which version of
         the forward pass to use (varlen or decode), whether to use CUDA graphs (with the eventual capture of the graph)
@@ -148,9 +155,7 @@ class ModelRunner:
         if batch_data["inputs_embeds"] is not None:
             with self.compute_stream_ctx():
                 self.fill_inputs_embeds(model, batch_data)
-            input_ids = batch_data.pop("input_ids")  # can be mutually exclusive with inputs_embeds
-        else:
-            input_ids = batch_data["input_ids"]
+        input_ids = self._pop_or_get_input_ids(batch_data)
 
         # Get the appropriate forward function (compiled or not, based on current path)
         forward_fn, use_cuda_graph = self._get_forward_fn(use_block_table=self.inputs_and_outputs.use_block_table)
@@ -199,7 +204,7 @@ class ModelRunner:
     def _forward_process_and_sample(
         self,
         model: nn.Module,
-        input_ids: torch.Tensor,  # separate from batch_data when there are input_embeds
+        input_ids: torch.Tensor,  # separate from batch_data when there are input_embeds # TODO: can this be avoided?
         batch_data: PagedAttentionArgs,
         carry_over_ids: torch.Tensor,
         prev_output_ids: torch.Tensor,
@@ -337,9 +342,10 @@ class ModelRunner:
                 future_states, self.logit_processor, use_decode_fast_path, padded_q, padded_kv
             )
             batch_data = self.inputs_and_outputs.get_model_kwargs(use_padding=True)
+            input_ids = self._pop_or_get_input_ids(batch_data)
             carry_over_ids, prev_output_ids, output_ids = self.inputs_and_outputs.get_cb_kwargs()
             forward_fn, use_cuda_graph = self._get_forward_fn(use_block_table=self.inputs_and_outputs.use_block_table)
-            forward_fn_args = (model, batch_data, carry_over_ids, prev_output_ids, output_ids)
+            forward_fn_args = (model, input_ids, batch_data, carry_over_ids, prev_output_ids, output_ids)
             if use_cuda_graph:
                 self._capture_graph(forward_fn, self.inputs_and_outputs.compute_stream, *forward_fn_args)
             else:
