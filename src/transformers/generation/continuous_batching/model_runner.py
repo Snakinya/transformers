@@ -148,7 +148,9 @@ class ModelRunner:
         if batch_data["inputs_embeds"] is not None:
             with self.compute_stream_ctx():
                 self.fill_inputs_embeds(model, batch_data)
-            batch_data["input_ids"] = None  # now that the inputs_embeds are filled, we can remove the input_ids
+            input_ids = batch_data.pop("input_ids")  # can be mutually exclusive with inputs_embeds
+        else:
+            input_ids = batch_data["input_ids"]
 
         # Get the appropriate forward function (compiled or not, based on current path)
         forward_fn, use_cuda_graph = self._get_forward_fn(use_block_table=self.inputs_and_outputs.use_block_table)
@@ -156,7 +158,7 @@ class ModelRunner:
         # If we are not using CUDA graphs, we perform the generation step and return
         if not use_cuda_graph:
             with self.compute_stream_ctx():
-                forward_fn(model, batch_data, carry_over_ids, prev_output_ids, output_ids)
+                forward_fn(model, input_ids, batch_data, carry_over_ids, prev_output_ids, output_ids)
 
         # Otherwise, we either create or replay the graph (CUDA is available in this path)
         else:
@@ -167,7 +169,7 @@ class ModelRunner:
                     graph.replay()
             # Otherwise, the graph does not exist, so we create it
             else:
-                args = (model, batch_data, carry_over_ids, prev_output_ids, output_ids)
+                args = (model, input_ids, batch_data, carry_over_ids, prev_output_ids, output_ids)
                 self._capture_graph(forward_fn, compute_stream, *args)
 
     def _get_forward_fn(self, use_block_table: bool) -> tuple[Callable, bool]:
@@ -197,6 +199,7 @@ class ModelRunner:
     def _forward_process_and_sample(
         self,
         model: nn.Module,
+        input_ids: torch.Tensor,  # separate from batch_data when there are input_embeds
         batch_data: PagedAttentionArgs,
         carry_over_ids: torch.Tensor,
         prev_output_ids: torch.Tensor,
@@ -205,7 +208,7 @@ class ModelRunner:
         """This function performs the forward pass, logits processing, and sampling. This is what is either captured
         and/or compiled."""
         # Perform carry-over (no-op for synchronous batching)
-        self.inputs_and_outputs.carry_over_tokens(batch_data["input_ids"], carry_over_ids, prev_output_ids)
+        self.inputs_and_outputs.carry_over_tokens(input_ids, carry_over_ids, prev_output_ids)
 
         # Run model forward pass and convert to fp32 to match generate
         logits = model(**batch_data).logits.float()
@@ -215,7 +218,7 @@ class ModelRunner:
             # Handle shape inconsistency between generate and continuous batching (dummy_dim is always 1)
             dummy_dim, num_tokens, vocab_size = logits.shape
             logits_2d = logits.view(dummy_dim * num_tokens, vocab_size)
-            input_ids_2d = batch_data["input_ids"].view(dummy_dim * num_tokens)
+            input_ids_2d = input_ids.view(dummy_dim * num_tokens)
             # Process with 2D tensors
             logits_2d = self.logit_processor(input_ids_2d, logits_2d, batch_data["logits_processor_args"])
             # Reshape back to 3D
