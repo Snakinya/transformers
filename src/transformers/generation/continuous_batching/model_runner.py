@@ -23,6 +23,7 @@ from torch import nn
 from ...generation.configuration_utils import ContinuousBatchingConfig
 from .cache import PagedAttentionCache
 from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
+from .encoder_cache import EncoderCache
 from .input_outputs import ContinuousBatchingAsyncIOs, ContinuousBatchingIOs
 from .requests import RequestStatus, logger
 from .utils import create_warmup_future_states, get_cuda_pools, mem_pool_ctx, pad_to_interval, pad_to_pow2
@@ -38,6 +39,7 @@ class ModelRunner:
         cb_config: ContinuousBatchingConfig,
         inputs_and_outputs: ContinuousBatchingIOs | ContinuousBatchingAsyncIOs,
         cache: PagedAttentionCache,
+        encoder_cache: EncoderCache,
         do_sample: bool,
         return_logprobs: bool,
     ) -> None:
@@ -50,6 +52,7 @@ class ModelRunner:
         self.return_logprobs = return_logprobs
         self.use_cuda_graph_varlen, self.use_cuda_graph_decode = self.cb_config.cuda_graph_booleans
         self.cache = cache
+        self.encoder_cache = encoder_cache
 
         # Padding only happen when CUDA graphs or compile is used
         cuda_graph = self.use_cuda_graph_varlen or self.use_cuda_graph_decode
@@ -76,6 +79,15 @@ class ModelRunner:
                 self._forward_process_and_sample, **self.cb_config.decode_compile_config.to_dict()
             )
 
+
+    def compute_stream_ctx(self) -> torch.cuda.Stream | nullcontext:
+        """Returns a context manager that runs enclosed ops on the compute stream, or a no-op when none is set."""
+        compute_stream = self.inputs_and_outputs.compute_stream
+        if compute_stream is None:
+            return nullcontext()
+        return torch.cuda.stream(compute_stream)
+
+
     def maybe_pad_inputs(self, num_q_tokens: int, max_kv_read: int, use_decode_fast_path: bool) -> tuple[int, int]:
         """Pads the input sizes for the next batch if it is needed. Often it is, for max performance."""
         if not self.pad_inputs:
@@ -91,6 +103,33 @@ class ModelRunner:
             max_kv_read = 0
         return num_q_tokens, max_kv_read
 
+    def run_encoder(self, model: nn.Module, encoder_kwargs: list[dict]) -> None:
+        """Runs the encoder on the given set of kwargs and stores the new embeddings in the encoder cache."""
+        with self.compute_stream_ctx():
+            for encoder_kw in encoder_kwargs:
+                encoder_kw["return_dict"] = True
+                request_id = encoder_kw.pop(self.encoder_cache.REQUEST_ID_KEY)
+                image_features = model.get_image_features(**encoder_kw).pooler_output
+                self.encoder_cache.store_mm_embeddings(request_id, image_features)
+
+
+    def fill_inputs_embeds(self, model: nn.Module, batch_data: dict) -> None:
+        """Fill the inputs_embeds tensor inside the batch_data dictionary."""
+        # Run the embedding layer to get all text tokens embeddings
+        input_ids = batch_data["input_ids"]
+        inputs_embeds = batch_data["inputs_embeds"]  # shape [1, q_tokens, hidden_size]
+        inputs_embeds.copy_(model.embed_tokens(input_ids))
+        # If there are no multimodal embeddings to incorporate, we can return early
+        mm_embeddings_read_index = batch_data.get("encoder_cache_read_index")  # shape [q_tokens] or None
+        if mm_embeddings_read_index is None:
+            return None
+        # Otherwise, retrieve the multimodal embeddings according to the index
+        mm_embeddings = self.encoder_cache.cache[mm_embeddings_read_index] # shape [q_tokens, hidden_size]
+        mm_embeddings = mm_embeddings.unsqueeze(0)  # shape [1, q_tokens, hidden_size]
+        mask = (mm_embeddings_read_index == -1).unsqueeze(-1)  # shape [1, q_tokens]
+        inputs_embeds.where_(mask, mm_embeddings)
+
+
     def compute_batch(self, model: nn.Module, batch_data: dict) -> None:
         """Runs the forward pass, processes the logits and samples the next tokens. It also handles which version of
         the forward pass to use (varlen or decode), whether to use CUDA graphs (with the eventual capture of the graph)
@@ -100,13 +139,16 @@ class ModelRunner:
         # This is the stream on which the compute happens
         compute_stream = self.inputs_and_outputs.compute_stream
 
+        if batch_data["inputs_embeds"] is not None:
+            with self.compute_stream_ctx():
+                self.fill_inputs_embeds(model, batch_data)
+
         # Get the appropriate forward function (compiled or not, based on current path)
         forward_fn, use_cuda_graph = self._get_forward_fn(use_block_table=self.inputs_and_outputs.use_block_table)
 
         # If we are not using CUDA graphs, we perform the generation step and return
         if not use_cuda_graph:
-            maybe_stream = torch.cuda.stream(compute_stream) if compute_stream is not None else nullcontext()
-            with maybe_stream:
+            with self.compute_stream_ctx():
                 forward_fn(model, batch_data, carry_over_ids, prev_output_ids, output_ids)
 
         # Otherwise, we either create or replay the graph (CUDA is available in this path)

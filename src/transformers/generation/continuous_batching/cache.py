@@ -123,6 +123,7 @@ class PagedAttentionCache:
         device: torch.device | str,
         distributed_helper: DistributedHelper,
         tp_plan: dict[str, Any],
+        encoder_cache_needed: bool,
         dtype: torch.dtype = torch.float16,
     ) -> None:
         """Initialize a paged attention cache for efficient memory usage. Also turns in prefix sharing if the model has
@@ -134,6 +135,7 @@ class PagedAttentionCache:
             device: Device for the cache tensors
             distributed_helper: TP-aware helper. Used to dispatch attention heads and ensure coherent cache size
             tp_plan: Tensor parallelism plan
+            encoder_cache_needed: Whether an encoder cache is needed or not
             dtype: Data type of the cache
         """
         self.config = config
@@ -211,6 +213,7 @@ class PagedAttentionCache:
             group_size=group_size,
             activation_peaks=[lm_head_peak, attention_peak],
             num_attention_masks=num_attention_masks,
+            encoder_cache_needed=encoder_cache_needed,
         )
 
         # If somehow the max memory percent is not yet resolved, resolve it conservatively
@@ -553,6 +556,7 @@ class PagedAttentionMemoryHandler:
         group_size: int,
         activation_peaks: list[tuple[int, int]],
         num_attention_masks: int,
+        encoder_cache_needed: bool,  # TODO: use this, and account for the fact that we now have input embeeds rather than just text tokens
     ) -> None:
         """Initialize the memory handler. `activation_peaks` is a list of `(Δcn, Δcm)` pairs giving the activation memory
         contributions proportional to N (pages) and M (batch tokens) for each peak. Memory must satisfy the constraint

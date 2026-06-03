@@ -35,13 +35,14 @@ from ..logits_process import LogitsProcessorList
 from .cache import PagedAttentionCache
 from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
 from .distributed import DistributedHelper
+from .encoder_cache import EncoderCache
 from .initialization import resolve_continuous_batching_config
 from .input_outputs import ContinuousBatchingAsyncIOs, ContinuousBatchingIOs
 from .model_runner import ModelRunner
 from .offloading_manager import OffloadingManager
 from .requests import GenerationOutput, RequestState, RequestStatus, logger
 from .scheduler import SCHEDULER_MAPPING, FIFOScheduler, Scheduler
-from .utils import WorkloadHints, drain_queue
+from .utils import WorkloadHints, check_modality_support, drain_queue
 
 
 """
@@ -194,6 +195,7 @@ class ContinuousBatchProcessor:
     def __init__(
         self,
         cache: PagedAttentionCache,
+        encoder_cache: EncoderCache | None,
         config: PretrainedConfig,
         generation_config: GenerationConfig,
         continuous_batching_config: ContinuousBatchingConfig,
@@ -211,6 +213,7 @@ class ContinuousBatchProcessor:
 
         Args:
             cache: A [`PagedAttentionCache`] object
+            encoder_cache: An [`EncoderCache`] object or None if no encoder cache is needed
             config: The model configuration
             generation_config: The generation configuration
             continuous_batching_config: The continuous batching configuration
@@ -225,6 +228,7 @@ class ContinuousBatchProcessor:
             distributed_helper: The [`DistributedHelper`] to use
         """
         self.cache = cache
+        self.encoder_cache = encoder_cache
         self.config = config
         self.cb_config = continuous_batching_config
         self.logit_processor = logit_processor
@@ -237,26 +241,22 @@ class ContinuousBatchProcessor:
         self.scheduler = scheduler
         self.distributed_helper = distributed_helper
 
-        # Generation-related attributes
-        self.do_sample = getattr(generation_config, "do_sample", True)
-        self.return_logprobs = continuous_batching_config.return_logprobs
-
         # Get an integer seed for the TP group. Also work for no TP.
         self.distributed_helper.set_tp_seed(continuous_batching_config.seed, model_device)
 
         # Retrieve the size of the sliding window if there is one
         self.sliding_window = 1 if getattr(config, "sliding_window", None) is None else config.sliding_window
-
         self.max_batch_tokens = cache.max_batch_tokens
 
         # Setup inputs and outputs
         use_cuda_graph_varlen, _ = self.cb_config.cuda_graph_booleans
         io_kwargs = {
             "cache": cache,
+            "encoder_cache": encoder_cache,
             "config": config,
             "device": model_device,
             "model_dtype": model_dtype,
-            "return_logprobs": self.return_logprobs,
+            "return_logprobs": continuous_batching_config.return_logprobs,
             "logit_processor": self.logit_processor,
             "use_cuda_graph_varlen": use_cuda_graph_varlen,
         }
@@ -284,9 +284,10 @@ class ContinuousBatchProcessor:
             logit_processor=self.logit_processor,
             cb_config=self.cb_config,
             cache=self.cache,
+            encoder_cache=self.encoder_cache,
             inputs_and_outputs=self.inputs_and_outputs,
-            do_sample=self.do_sample,
-            return_logprobs=self.return_logprobs,
+            do_sample=getattr(generation_config, "do_sample", True),
+            return_logprobs=continuous_batching_config.return_logprobs,
         )
 
     def __repr__(self) -> str:
@@ -377,7 +378,7 @@ class ContinuousBatchProcessor:
         if not self.scheduler.has_pending_requests():
             return False
 
-        # Schedule the next batch of requests
+        # Schedule the next batch of requests # TODO: maybe this should be an object + have the MM info
         requests_in_batch, use_decode_fast_path, num_q_tokens, max_kv_read = self.scheduler.schedule_batch(
             self.max_batch_tokens, self.cache.num_pages
         )
@@ -511,6 +512,11 @@ class ContinuousBatchProcessor:
         # Retrieve the model kwargs with or without padding. After this function returns, everything happens on the
         # device. Hence, to make the limit clear, this is left out of the model runner scope.
         batch_data = self.inputs_and_outputs.get_model_kwargs(use_padding=self.model_runner.pad_inputs)
+
+        # If there are multimodal inputs to embed, we do it here # TODO: cuda-graph, async support, compile
+        encoder_kwargs = self.inputs_and_outputs.encoder_kwargs
+        if encoder_kwargs:
+            self.model_runner.run_encoder(model, encoder_kwargs)
 
         # This takes care of the forward pass, logits processing, and sampling. After this returns, the compute is
         # scheduled on the device's compute stream, but may not have finished yet.
@@ -948,16 +954,30 @@ class ContinuousBatchingManager:
             batch_processor.reset()
             return batch_processor
 
-        # Create the PagedAttentionCache
+        # Create the paged attention cache (for KV) and maybe an encoder cache (for multimodal embeddings)
+        encoder_cache_needed = check_modality_support(self.model.input_modalities)
+        # The KV cache is dimensionned to take the encoder cache into account if there is one
         paged_attention_cache = PagedAttentionCache(
             config=self.model.config,
             continuous_batching_config=self.continuous_batching_config,
             device=self.model.device,
             distributed_helper=self.distributed_helper,
             tp_plan=getattr(self.model, "tp_plan", {}),
+            encoder_cache_needed=encoder_cache_needed,
             dtype=self.model.dtype,
         )
         self._use_prefix_sharing = paged_attention_cache.use_prefix_sharing  # update the approximation
+        # Create the encoder cache if needed
+        if encoder_cache_needed:
+            encoder_cache = EncoderCache(
+                max_batch_tokens=paged_attention_cache.max_batch_tokens,
+                hidden_size=self.model.config.hidden_size,
+                image_token_id=self.model.config.image_token_id,
+                model_dtype=self.model.dtype,
+                device=self.model.device,
+            )
+        else:
+            encoder_cache = None
 
         # Disable the decode path if the model has sliding window attention (TODO)
         if paged_attention_cache.num_sliding_attention_groups > 0:
@@ -973,6 +993,7 @@ class ContinuousBatchingManager:
         # Create the batch processor
         batch_processor = ContinuousBatchProcessor(
             cache=paged_attention_cache,
+            encoder_cache=encoder_cache,
             config=self.model.config,
             generation_config=self.generation_config,
             continuous_batching_config=self.continuous_batching_config,
@@ -983,7 +1004,7 @@ class ContinuousBatchingManager:
             background_thread_status=self.background_thread_status,
             model_device=self.model.device,
             model_dtype=self.model.dtype,
-            scheduler=scheduler(paged_attention_cache),
+            scheduler=scheduler(paged_attention_cache, encoder_cache),
             distributed_helper=self.distributed_helper,
         )
         return batch_processor

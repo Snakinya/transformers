@@ -180,6 +180,27 @@ def build_attention_mask(
         attention_mask[..., query_range, key_range] = masked
 
 
+def check_modality_support(input_modalities: list[str]) -> bool:
+    """Check if CB supports the given input modalities and returns True if the model is multimodal."""
+
+    # Raise an error if the model supports no modalities in CB's supported set
+    supported_modalities = set(input_modalities).union({"text", "image"})
+    if len(supported_modalities) == 0:
+        raise ValueError(f"This model supports {input_modalities = } but CB only supports text and image.")
+
+    # Throw a warning if the model supports modalities that are not in CB's supported set
+    unsupported_modalities = set(input_modalities) - supported_modalities
+    if len(unsupported_modalities) > 0:
+        raise ValueError(
+            f"This model supports {input_modalities = } but CB only supports text and image. "
+            f"The following modalities will be ignored: {unsupported_modalities = }"
+        )
+
+    # The encoder cache is only needed if the model supports a CB-supported modality other than text
+    use_encoder_cache = "image" in input_modalities
+    return use_encoder_cache
+
+
 def create_warmup_future_states(
     num: int,
     status: RequestStatus,

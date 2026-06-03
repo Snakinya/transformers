@@ -22,17 +22,21 @@ from transformers.configuration_utils import PretrainedConfig
 
 from ...utils import get_available_devices
 from .cache import PagedAttentionCache
+from .encoder_cache import EncoderCache
 from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
 from .requests import TMP_TOKEN_ID, FutureRequestState, logger
 from .utils import CudaGraphBuffer, aligned_divide, attn_mask_is_needed, build_attention_mask, pad_to_pow2
 
 
+# TODO: perhaps this class could benefit from a parent class + inheritance for different use cases
 @dataclass
 class PagedAttentionArgs:
     """Dataclass containing the keyword arguments for a forward pass using paged attention.
 
     Attributes:
         input_ids: Input token IDs tensor of shape `(1, total_query_tokens)`.
+        inputs_embeds: Input embeddings tensor of shape `(1, total_query_tokens, hidden_size)`.
+            Is `None` if the model is text-only.
         attention_mask: Attention mask tensor or dictionary mapping layer types to masks. Can be `None` if the
             attention implementation doesn't require explicit masks.
         position_ids: Position IDs tensor of shape `(1, total_query_tokens)`.
@@ -43,6 +47,7 @@ class PagedAttentionArgs:
         max_seqlen_k: Maximum key/value sequence length. Can be an int or dictionary for hybrid models.
         write_index: List of tensors indicating where to write new KV states in the cache, one per attention group.
         read_index: List of tensors indicating which cache positions to read from, one per attention group.
+        encoder_cache_read_index: Tensor indicating which positions in the encoder cache to read from.
         logits_indices: Tensor indicating which positions in the output should be used for next-token prediction.
         cache: The [`PagedAttentionCache`] instance managing the KV cache.
         block_table: Block table for paged KV cache. If provided, uses `flash_attn_with_kvcache` for fused attention +
@@ -52,6 +57,7 @@ class PagedAttentionArgs:
     """
 
     input_ids: torch.Tensor
+    inputs_embeds: torch.Tensor | None
     attention_mask: torch.Tensor | dict[str, torch.Tensor] | None
     position_ids: torch.Tensor
     cu_seq_lens_q: torch.Tensor
@@ -60,6 +66,7 @@ class PagedAttentionArgs:
     max_seqlen_k: int | dict[str, int]
     write_index: list[torch.Tensor]
     read_index: list[torch.Tensor]
+    encoder_cache_read_index: torch.Tensor | None
     logits_indices: torch.Tensor
     cache: PagedAttentionCache
     block_table: torch.Tensor | None
@@ -69,6 +76,7 @@ class PagedAttentionArgs:
     def asdict(self) -> dict[str, Any]:
         return {
             "input_ids": self.input_ids,
+            "inputs_embeds": self.inputs_embeds,
             "attention_mask": self.attention_mask,
             "position_ids": self.position_ids,
             "cu_seq_lens_q": self.cu_seq_lens_q,
@@ -77,6 +85,7 @@ class PagedAttentionArgs:
             "max_seqlen_k": self.max_seqlen_k,
             "write_index": self.write_index,
             "read_index": self.read_index,
+            "encoder_cache_read_index": self.encoder_cache_read_index,
             "logits_indices": self.logits_indices,
             "cache": self.cache,
             "block_table": self.block_table,
@@ -91,18 +100,20 @@ class ContinuousBatchingIOs:
     batch alone.
     """
 
-    static_inputs: int = 7  # Number of static inputs always present in the bulk tensor
+    static_inputs: int = 8 # Number of static inputs always present in the bulk tensor
 
     def __init__(
         self,
         cache: PagedAttentionCache,
+        encoder_cache: EncoderCache | None,
         config: PretrainedConfig,
         device: torch.device,
         model_dtype: torch.dtype,
         max_graphs: int,
         return_logprobs: bool,
         logit_processor: ContinuousBatchingLogitsProcessorList,
-        use_cuda_graph_varlen: bool = False,
+        use_cuda_graph_varlen: bool,
+        allocate_inputs_embeds: bool = True,
     ) -> None:
         """Initialize the continuous batching I/O manager. Args:
         - cache: The [`PagedAttentionCache`] instance managing the KV cache. Meant to be unique.
@@ -113,9 +124,11 @@ class ContinuousBatchingIOs:
         - return_logprobs: Whether to return log probabilities along with the token IDs.
         - logit_processor: The [`ContinuousBatchingLogitsProcessorList`] object used to process the logits.
         - use_cuda_graph_varlen: Whether CUDA graphs are enabled for the varlen (prefill) path.
+        - allocate_inputs_embeds: Whether to allocate an input embeddings tensor. If None, auto-inferred.
         """
         # Memoize attributes
         self.cache = cache
+        self.encoder_cache = encoder_cache
         self.device = device
         self.config = config
         self.model_dtype = model_dtype
@@ -129,17 +142,22 @@ class ContinuousBatchingIOs:
         self.true_read_sizes = [0 for _ in range(cache.num_groups)]
         self.true_write_sizes = [0 for _ in range(cache.num_groups)]
         self.use_block_table = False  # True if all requests in batch have query_length == 1
+        # Encoder-related accumulators
+        self.encoder_kwargs = []  # list of kwargs for the encoder to produce multimodal embeddings
+        self.encoder_cache_read = False  # whether the encoder cache is read from in the current batch
         # Setup other accumulators
         self.requests_in_batch: list[FutureRequestState] = []
         self.req_id_to_new_token_position: dict[str, int] = {}  # only used for async API
         self.graphs: CudaGraphBuffer = CudaGraphBuffer(max_graphs)
         self._trash_index = cache.trash_index
         # Setup static tensors and compute stream
-        self._setup_static_tensors(logit_processor=logit_processor)
+        self._setup_static_tensors(logit_processor=logit_processor, allocate_inputs_embeds=allocate_inputs_embeds)
         self._reset_static_tensors(full_reset=True)
         self.compute_stream = torch.cuda.Stream(device=self.device) if device.type == "cuda" else None
 
-    def _setup_static_tensors(self, logit_processor: ContinuousBatchingLogitsProcessorList) -> None:
+    def _setup_static_tensors(
+        self, logit_processor: ContinuousBatchingLogitsProcessorList, allocate_inputs_embeds: bool
+    ) -> None:
         """Allocates static tensors for generation inputs and outputs. This is called only once at init time, to avoid
         repeated allocations and enable CUDA graphs. All tensors are allocated with maximum possible sizes.
         The allocated tensors are:
@@ -173,9 +191,11 @@ class ContinuousBatchingIOs:
         self.position_ids = self._bulk_input_tensor[1, :max_batch_tokens]
         self.cumulative_seqlens_q = self._bulk_input_tensor[2, : max_batch_tokens + 1]
         self.logits_indices = self._bulk_input_tensor[3, :max_batch_tokens]
+        # TODO: make the ones below dynamic
         full_attention_cumulative_seqlens_k = self._bulk_input_tensor[4, : max_batch_tokens + 1]
         sliding_attention_cumulative_seqlens_k = self._bulk_input_tensor[5, : max_batch_tokens + 1]
         self.carry_over_ids = self._bulk_input_tensor[6, :max_batch_tokens]  # only used for async API
+        self.encoder_cache_read_index = self._bulk_input_tensor[7, : max_batch_tokens]  # only used for multimodal model
 
         # For sequence length of KV, the entries in the dict depend on the model
         self.cumulative_seqlens_k: dict[str, torch.Tensor] = {}
@@ -183,6 +203,14 @@ class ContinuousBatchingIOs:
             self.cumulative_seqlens_k["full_attention"] = full_attention_cumulative_seqlens_k
         if self.cache.num_sliding_attention_groups:
             self.cumulative_seqlens_k["sliding_attention"] = sliding_attention_cumulative_seqlens_k
+
+        # If allocated, the input embeddings tensor is not part of the bulk tensor, because it is device-resident
+        if allocate_inputs_embeds:
+            self.inputs_embeds = torch.empty(
+                (max_batch_tokens, self.config.hidden_size), dtype=self.model_dtype, device=self.device,
+            )
+        else:
+            self.inputs_embeds = None
 
         # Output tensor and scalars
         num_output_rows = 2 if self.return_logprobs else 1
@@ -271,6 +299,9 @@ class ContinuousBatchingIOs:
 
         # Reset the attributes part of the bulk input tensor in one kernel
         self._bulk_input_tensor[: self.static_inputs, : q_len + 1].zero_()
+        # Safe for the encoder cache read index, which is reset to -1
+        self.encoder_cache_read_index[:q_len].fill_(-1)
+        # ... and the logits processors arguments, which are reset to their default values
         if full_reset:
             self._bulk_input_tensor[self.static_inputs :] = self.logits_processors_defaults
         self.max_seqlen_q = 0
@@ -371,6 +402,8 @@ class ContinuousBatchingIOs:
         self.true_write_sizes = [0 for _ in range(self.cache.num_groups)]
         self.requests_in_batch = []
         self.req_id_to_new_token_position = {}
+        self.encoder_kwargs = []
+        self.encoder_cache_read = False
 
         # Prepare accumulators. For batches with no past cache to read, we leave read_index empty: the cache.update
         # will detect the 0-size indices and skip the read.
@@ -381,6 +414,7 @@ class ContinuousBatchingIOs:
         cumulative_seqlens_k = {layer_type: [0] for layer_type in self.cumulative_seqlens_k.keys()}
         write_index = [[] for _ in range(self.cache.num_groups)]
         read_index = None if self.max_kv_read == 0 else [[] for _ in range(self.cache.num_groups)]
+        encoder_cache_read_index = []
 
         # Go through all the requests in the batch
         for i, future_state in enumerate(requests_in_batch):
@@ -411,12 +445,24 @@ class ContinuousBatchingIOs:
                 self.cache.extend_read_and_write_indices(
                     state.request_id, past_length, query_length, read_index, write_index
                 )
+            # Also accumulate the encoder cache read index if there is an encoder cache
+            if self.encoder_cache is not None:
+                self.encoder_cache_read |= self.encoder_cache.extend_read_indices(
+                    state.request_id, past_length, query_length, encoder_cache_read_index
+                )
 
             # If the request has no remaining prefill tokens, it means the next token prediction is relevant
             if future_state.has_new_token:
                 logits_indices.append(cumulative_seqlens_q[-1] - 1)
                 state.tokens_to_process = [TMP_TOKEN_ID]
                 self.req_id_to_new_token_position[state.request_id] = logits_indices[-1]
+
+            # If the request is an encoder request, we accumulate the encoder arguments
+            if state.multimodal_data:
+                mm_data = state.multimodal_data
+                mm_data[self.encoder_cache.REQUEST_ID_KEY] = state.request_id  # type: ignore (was already checked)
+                self.encoder_kwargs.append(mm_data)
+                state.multimodal_data = {}  # means there was multimodal data and it has already been processed
 
             self.requests_in_batch.append(future_state)
 
@@ -470,6 +516,7 @@ class ContinuousBatchingIOs:
         # Prepare the kwargs, the attributes that are either tensors or dict of tensors are initialized to empty dicts.
         kwargs = PagedAttentionArgs(
             input_ids=self.input_ids[:q_size].unsqueeze(0),
+            inputs_embeds=None if self.inputs_embeds is None else self.inputs_embeds[:q_size].unsqueeze(0),
             position_ids=self.position_ids[:q_size].unsqueeze(0),
             cu_seq_lens_q=self.cumulative_seqlens_q[: batch_size + 1],
             max_seqlen_q=self.max_seqlen_q,
@@ -480,6 +527,7 @@ class ContinuousBatchingIOs:
             attention_mask=None if self.attention_mask is None else {},
             read_index=[],
             write_index=[],
+            encoder_cache_read_index=self.encoder_cache_read_index[:q_size] if self.encoder_cache_read else None,
             cache=self.cache,
             block_table=self.block_table[:, :batch_size] if self.use_block_table else None,
             use_cache=False,
@@ -563,34 +611,39 @@ class HostDeviceIOPair:
     def __init__(
         self,
         cache: PagedAttentionCache,
+        encoder_cache: EncoderCache | None,
         config: PretrainedConfig,
         device: torch.device,
         model_dtype: torch.dtype,
         max_graphs: int,
         return_logprobs: bool,
         logit_processor: ContinuousBatchingLogitsProcessorList,
-        use_cuda_graph_varlen: bool = False,
+        use_cuda_graph_varlen: bool,
     ) -> None:
         # The host IO has automatic pinned memory because it is created on the CPU
         self.host_io = ContinuousBatchingIOs(
-            cache,
-            config,
-            torch.device("cpu"),
-            model_dtype,
-            max_graphs,
-            return_logprobs,
-            logit_processor,
-            use_cuda_graph_varlen,
+            cache=cache,
+            encoder_cache=encoder_cache,
+            config=config,
+            device=torch.device("cpu"),
+            model_dtype=model_dtype,
+            max_graphs=max_graphs,
+            return_logprobs=return_logprobs,
+            logit_processor=logit_processor,
+            use_cuda_graph_varlen=use_cuda_graph_varlen,
+            allocate_inputs_embeds=False,  # never needed on the CPU side
         )
         self.device_io = ContinuousBatchingIOs(
-            cache,
-            config,
-            device,
-            model_dtype,
-            max_graphs,
-            return_logprobs,
-            logit_processor,
-            use_cuda_graph_varlen,
+            cache=cache,
+            encoder_cache=encoder_cache,
+            config=config,
+            device=device,
+            model_dtype=model_dtype,
+            max_graphs=max_graphs,
+            return_logprobs=return_logprobs,
+            logit_processor=logit_processor,
+            use_cuda_graph_varlen=use_cuda_graph_varlen,
+            allocate_inputs_embeds=True,
         )
         # Create events only on CUDA devices
         self.h2d_over = torch.cuda.Event() if torch.cuda.is_available() else None
@@ -662,13 +715,14 @@ class ContinuousBatchingAsyncIOs:
     def __init__(
         self,
         cache: PagedAttentionCache,
+        encoder_cache: EncoderCache | None,
         config: PretrainedConfig,
         device: torch.device,
         model_dtype: torch.dtype,
         max_graphs: int,
         return_logprobs: bool,
         logit_processor: ContinuousBatchingLogitsProcessorList,
-        use_cuda_graph_varlen: bool = False,
+        use_cuda_graph_varlen: bool,
     ) -> None:
         # Async batching needs streams to function, so check is CUDA is available
         if not torch.cuda.is_available():
@@ -677,14 +731,15 @@ class ContinuousBatchingAsyncIOs:
         self.current_pair = 0
         self.io_pairs = [
             HostDeviceIOPair(
-                cache,
-                config,
-                device,
-                model_dtype,
-                max_graphs,
-                return_logprobs,
-                logit_processor,
-                use_cuda_graph_varlen,
+                cache=cache,
+                encoder_cache=encoder_cache,
+                config=config,
+                device=device,
+                model_dtype=model_dtype,
+                max_graphs=max_graphs,
+                return_logprobs=return_logprobs,
+                logit_processor=logit_processor,
+                use_cuda_graph_varlen=use_cuda_graph_varlen,
             )
             for _ in range(2)
         ]
@@ -782,6 +837,10 @@ class ContinuousBatchingAsyncIOs:
     def output_ids(self) -> torch.Tensor:
         # The output ids are used to copy_ the infered tokens: they need to be on the device
         return self.io_pairs[self.current_pair].device_io.output_ids
+
+    @property
+    def encoder_kwargs(self) -> list[dict]:
+        return self.io_pairs[self.current_pair].host_io.encoder_kwargs
 
     def get_graph(self) -> torch.cuda.CUDAGraph | None:
         return self.io_pairs[self.current_pair].device_io.get_graph()
