@@ -24,7 +24,7 @@ from ...generation.configuration_utils import ContinuousBatchingConfig
 from .cache import PagedAttentionCache
 from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
 from .encoder_cache import EncoderCache
-from .input_outputs import ContinuousBatchingAsyncIOs, ContinuousBatchingIOs
+from .input_outputs import ContinuousBatchingAsyncIOs, ContinuousBatchingIOs, PagedAttentionArgs
 from .requests import RequestStatus, logger
 from .utils import create_warmup_future_states, get_cuda_pools, mem_pool_ctx, pad_to_interval, pad_to_pow2
 
@@ -113,11 +113,11 @@ class ModelRunner:
                 self.encoder_cache.store_mm_embeddings(request_id, image_features)
 
 
-    def fill_inputs_embeds(self, model: nn.Module, batch_data: dict) -> None:
+    def fill_inputs_embeds(self, model: nn.Module, batch_data: PagedAttentionArgs) -> None:
         """Fill the inputs_embeds tensor inside the batch_data dictionary."""
         # Run the embedding layer to get all text tokens embeddings
         input_ids = batch_data["input_ids"]
-        inputs_embeds = batch_data["inputs_embeds"]  # shape [1, q_tokens, hidden_size]
+        inputs_embeds: torch.Tensor = batch_data["inputs_embeds"]  # shape [1, q_tokens, hidden_size]
         inputs_embeds.copy_(model.embed_tokens(input_ids))
         # If there are no multimodal embeddings to incorporate, we can return early
         mm_embeddings_read_index = batch_data.get("encoder_cache_read_index")  # shape [q_tokens] or None
@@ -130,7 +130,7 @@ class ModelRunner:
         inputs_embeds.where_(mask, mm_embeddings)
 
 
-    def compute_batch(self, model: nn.Module, batch_data: dict) -> None:
+    def compute_batch(self, model: nn.Module, batch_data: PagedAttentionArgs) -> None:
         """Runs the forward pass, processes the logits and samples the next tokens. It also handles which version of
         the forward pass to use (varlen or decode), whether to use CUDA graphs (with the eventual capture of the graph)
         and torch compile."""
@@ -190,7 +190,7 @@ class ModelRunner:
     def _forward_process_and_sample(
         self,
         model: nn.Module,
-        batch_data: dict,
+        batch_data: PagedAttentionArgs,
         carry_over_ids: torch.Tensor,
         prev_output_ids: torch.Tensor,
         output_ids: torch.Tensor,
