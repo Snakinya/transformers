@@ -185,8 +185,9 @@ class ContinuousBatchingIOs:
 
         # If allocated, the input embeddings tensor is not part of the bulk tensor, because it is device-resident
         if use_inputs_embeds:
+            hidden_size = getattr(self.config, "hidden_size", self.config.text_config.hidden_size)
             self.inputs_embeds = torch.empty(
-                (max_batch_tokens, self.config.hidden_size), dtype=self.model_dtype, device=self.device,
+                (max_batch_tokens, hidden_size), dtype=self.model_dtype, device=self.device,
             )
         else:
             self.inputs_embeds = None
