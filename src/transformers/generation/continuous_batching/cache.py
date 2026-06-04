@@ -220,6 +220,7 @@ class PagedAttentionCache:
         num_blocks, max_batch_tokens = memory_handler.infer_num_blocks_and_max_batch_tokens(
             num_blocks=continuous_batching_config.num_blocks,
             max_batch_tokens=continuous_batching_config.max_batch_tokens,
+            cache_fill_per_batch=continuous_batching_config.cache_fill_per_batch,
             max_memory_percent=continuous_batching_config.max_memory_percent,
             cache_dtype=self.dtype,
         )
@@ -542,7 +543,7 @@ class PagedAttentionMemoryHandler:
 
     _activation_dtype = torch.bfloat16
     _input_dtype = torch.int32
-    _upper_bound_max_batch_tokens = 1024
+    _upper_bound_max_batch_tokens = 16384
     _upper_bound_num_blocks = 4096
 
     def __init__(
@@ -638,6 +639,7 @@ class PagedAttentionMemoryHandler:
         available: int,
         num_blocks: int | None,
         max_batch_tokens: int | None,
+        cache_fill_per_batch: float,
         cache_dtype: torch.dtype,
     ) -> tuple[int, int]:
         """Solve for `(num_blocks, max_batch_tokens)` against one activation peak's memory polynomial. Clamps to upper
@@ -646,9 +648,10 @@ class PagedAttentionMemoryHandler:
 
         if num_blocks is None and max_batch_tokens is None:
             # Substitute M = m·N → (coeff_nm·m + coeff_mm·m²)·N² + (coeff_n + coeff_m·m)·N − avail = 0
-            m = 0.01
+            m = cache_fill_per_batch
             num_pages = self._solve_quadratic(cnm * m + cmm * m**2, cn + cm * m, -available)
             max_batch_tokens = int(num_pages * m)
+            max_batch_tokens = 32 * max(1, max_batch_tokens // 32)  # always align to 32
             if max_batch_tokens > self._upper_bound_max_batch_tokens:
                 max_batch_tokens = self._upper_bound_max_batch_tokens
                 # If max_batch_tokens is clamped, we recompute num_blocks below to get a higher value
@@ -671,10 +674,11 @@ class PagedAttentionMemoryHandler:
 
     def infer_num_blocks_and_max_batch_tokens(
         self,
-        num_blocks: int | None = None,
-        max_batch_tokens: int | None = None,
-        max_memory_percent: float = 0.9,
-        cache_dtype: torch.dtype = torch.float16,
+        num_blocks: int | None,
+        max_batch_tokens: int | None,
+        cache_fill_per_batch: float,
+        max_memory_percent: float,
+        cache_dtype: torch.dtype,
     ) -> tuple[int, int]:
         """Solve for the missing variable(s) in the memory polynomial (see ``_equation_coefficients``). There is one
         polynomial per activation peak; we solve each independently and take the most restrictive (smallest) result.
@@ -687,7 +691,9 @@ class PagedAttentionMemoryHandler:
         acc_num_blocks = float("inf")
         acc_max_batch_tokens = float("inf")
         for peak in self.activation_peaks:
-            n_blocks, m_batch_tokens = self._solve_for_peak(peak, available, num_blocks, max_batch_tokens, cache_dtype)
+            n_blocks, m_batch_tokens = self._solve_for_peak(
+                peak, available, num_blocks, max_batch_tokens, cache_fill_per_batch, cache_dtype
+            )
             acc_num_blocks = min(acc_num_blocks, n_blocks)
             acc_max_batch_tokens = min(acc_max_batch_tokens, m_batch_tokens)
         # Now update the value (cannot update in loop, it would overwrite the user-passed values)

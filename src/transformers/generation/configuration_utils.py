@@ -1616,6 +1616,9 @@ class ContinuousBatchingConfig:
             Number of blocks in the KV cache. Auto-inferred from GPU memory when `None`.
         max_batch_tokens (`int`, *optional*):
             Maximum number of tokens in a batch. Auto-inferred from GPU memory when `None`.
+        cache_fill_per_batch (`float`, *optional*):
+            Used when neither `num_blocks` nor `max_batch_tokens` are set: the maximum percentage of the cache that can
+            be filled by a single batch. Defaults to 0.03. Ignored if `num_blocks` or `max_batch_tokens` are set.
         max_memory_percent (`float`, *optional*):
             Maximum percentage of free GPU memory (after the model is loaded) to use for the KV cache. When `None`,
             resolved at runtime to 0.9 if there is no logit processing and 0.8 if there is, to leave headroom for
@@ -1684,6 +1687,10 @@ class ContinuousBatchingConfig:
     # these can be auto inferred using GPU size.
     num_blocks: int | None = None
     max_batch_tokens: int | None = None
+    # If neither `num_blocks` nor `max_batch_tokens` are set, we compute both based on the percentage of cache a single
+    # batch can fill. The larger this is, the less cache can be allocated and the faster it will fill up, so increasing
+    # this value may lead to decreasing performance.
+    cache_fill_per_batch: float = 0.03 # TODO: find a smarter default value / change this mechanism
 
     # The max percentage of free GPU memory (after the model is loaded) to use for the KV cache. If None, auto resolved
     # to 0.9 (no logit processing) or 0.8 (logit processing) to leave headroom for temporary tensors.
