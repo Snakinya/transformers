@@ -88,7 +88,7 @@ def resolve_without_hints(cb_config: ContinuousBatchingConfig) -> None:
     if cb_config.max_blocks_per_request is None:
         cb_config.max_blocks_per_request = 32
     if cb_config.max_cached_graphs == 0:
-        cb_config.max_cached_graphs = 32
+        cb_config.max_cached_graphs = 128
 
 
 def ensure_decode_fast_path_is_available(
