@@ -22,6 +22,7 @@ from ...generation.configuration_utils import ContinuousBatchingConfig
 from ...utils.generic import is_flash_attention_requested
 from .cache_manager import BlockManager, CacheAllocator, FullAttentionCacheAllocator, SlidingAttentionCacheAllocator
 from .distributed import DistributedHelper
+from .encoder_cache import EncoderCache
 from .initialization import resolve_max_memory_percent
 from .requests import RequestState, RequestStatus, get_device_and_memory_breakdown, logger
 from .utils import find_head_dim, find_num_kv_heads
@@ -121,8 +122,8 @@ class PagedAttentionCache:
         self,
         config: PreTrainedConfig,
         continuous_batching_config: ContinuousBatchingConfig,
-        is_multimodal_model: bool,
-        device: torch.device | str,
+        mm_modality: str | None,
+        device: torch.device | str,  # TODO: add PP support
         distributed_helper: DistributedHelper,
         tp_plan: dict[str, Any],
         dtype: torch.dtype = torch.float16,
@@ -133,23 +134,23 @@ class PagedAttentionCache:
         Args:
             config: Model configuration
             continuous_batching_config: Continuous batching configuration containing cache parameters
-            is_multimodal_model: If True, then we also account for the encoder cache and the input
+            mm_modality: The modality of the multimodal inputs
             device: Device for the cache tensors
             distributed_helper: TP-aware helper. Used to dispatch attention heads and ensure coherent cache size
             tp_plan: Tensor parallelism plan
-            dtype: Data type of the cache
+            dtype: Data type of the cache (for now, same as the model)
         """
         self.dtype = dtype
         self.device = device
 
         # For most attributes, the relevant values are inside the text model (LLM) config, not the main config
+        is_multimodal_model = mm_modality is not None
         llm_config = config.text_config if is_multimodal_model and hasattr(config, "text_config") else config
 
         # Extract model dimensions
         self.num_key_value_heads = find_num_kv_heads(llm_config)
         self.head_dim = find_head_dim(llm_config)
-
-        # Extract cache dimensions. Default used to be 32, now it's 256 to be compatible with flash_with_kvcache.
+        # Extract cache dimensions
         self.block_size = continuous_batching_config.block_size
         if self.block_size <= 0:
             raise ValueError(f"Block size must be positive, but got {self.block_size}")
@@ -211,6 +212,7 @@ class PagedAttentionCache:
         memory_handler = PagedAttentionMemoryHandler(
             continuous_batching_config=continuous_batching_config,
             page_size=page_size,
+            hidden_size=llm_config.hidden_size,
             num_groups=self.num_groups,
             group_size=group_size,
             activation_peaks=[lm_head_peak, attention_peak],
@@ -296,6 +298,19 @@ class PagedAttentionCache:
 
         # For block table support, we lazy init the name of the block table key
         self._block_table_key = None
+
+        # If there is one, initialize the encoder cache
+        if is_multimodal_model:
+            self.encoder_cache = EncoderCache(
+                config=config,
+                modality=mm_modality,
+                max_batch_tokens=max_batch_tokens,
+                use_async_batching=continuous_batching_config.use_async_batching,
+                model_dtype=self.dtype,
+                device=self.device,
+            )
+        else:
+            self.encoder_cache = None
 
     def will_allocation_be_successful(self, num_requested_blocks: int, allocated_blocks: int) -> bool:
         """Returns a boolean indicating if the allocation of (num_requested_blocks) blocks will be successful. The
@@ -554,21 +569,24 @@ class PagedAttentionMemoryHandler:
         self,
         continuous_batching_config: ContinuousBatchingConfig,
         page_size: int,
+        hidden_size: int,
         num_groups: int,
         group_size: int,
         activation_peaks: list[tuple[int, int]],
         num_attention_masks: int,
-        is_multimodal_model: bool,  # TODO: use this, and account for the fact that we now have input embeeds rather than just text tokens
+        is_multimodal_model: bool,
     ) -> None:
         """Initialize the memory handler. `activation_peaks` is a list of `(Δcn, Δcm)` pairs giving the activation memory
         contributions proportional to N (pages) and M (batch tokens) for each peak. Memory must satisfy the constraint
         at every peak, so we solve each polynomial independently and take the most restrictive result."""
         self.block_size = continuous_batching_config.block_size
         self.page_size = page_size
+        self.hidden_size = hidden_size
         self.num_groups = num_groups
         self.group_size = group_size
         self.activation_peaks = activation_peaks
         self.num_attention_masks = num_attention_masks
+        self.is_multimodal_model = is_multimodal_model
         self.max_blocks_per_request = continuous_batching_config.max_blocks_per_request
         if self.max_blocks_per_request is None:
             self.max_blocks_per_request = continuous_batching_config.fallback_max_blocks_per_request
@@ -599,6 +617,7 @@ class PagedAttentionMemoryHandler:
         a = self._activation_dtype.itemsize  # bfloat16
         c = cache_dtype.itemsize
         k = self.io_multiplier               # 1 sync, 2 async (IO tensors only)
+        mm = self.is_multimodal_model         # 1 if multimodal model, 0 otherwise
         delta_n, delta_m = peak
 
         # -- N terms: cost per cache page --------------------------------------------------
@@ -610,12 +629,13 @@ class PagedAttentionMemoryHandler:
         # -- M terms: cost per batch token -------------------------------------------------
         coeff_m = (
             delta_m * a                                # activation peak: M-proportional part
-            + k * 7 * i                                # bulk_input: [7, M] int32, packed as 7 rows
+            + k * 8 * i                                # bulk_input: [7, M] int32, packed as 7 rows
             + k * self.num_output_rows * i             # output_ids: [num_output_rows, M] int32
             + k * self.num_groups                      # block_table: [bt_groups, M, max_blocks_per_req] int32
             * self.max_blocks_per_request * i          #   (zero when fast-decode is off)
             + k * self.num_groups * 8                  # write_index: [num_groups, M] int64
             + k * self.num_groups * 8                  # read_index: [num_groups, N + M] (M part only, int64)
+            + k * mm * self.hidden_size * a            # input_embeds: [M, hidden_size] * activation_dtype
         )
         # -- N·M terms: cost per (page × batch token) --------------------------------------
         coeff_nm = k * self.num_attention_masks * a    # attention_mask: [1, 1, M, N + M] (N·M part only)

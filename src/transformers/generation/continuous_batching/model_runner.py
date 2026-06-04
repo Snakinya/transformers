@@ -23,7 +23,6 @@ from torch import nn
 from ...generation.configuration_utils import ContinuousBatchingConfig
 from .cache import PagedAttentionCache
 from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
-from .encoder_cache import EncoderCache
 from .input_outputs import ContinuousBatchingAsyncIOs, ContinuousBatchingIOs, PagedAttentionArgs
 from .requests import RequestStatus, logger
 from .utils import create_warmup_future_states, get_cuda_pools, mem_pool_ctx, pad_to_interval, pad_to_pow2
@@ -39,7 +38,6 @@ class ModelRunner:
         cb_config: ContinuousBatchingConfig,
         inputs_and_outputs: ContinuousBatchingIOs | ContinuousBatchingAsyncIOs,
         cache: PagedAttentionCache,
-        encoder_cache: EncoderCache,
         do_sample: bool,
         return_logprobs: bool,
     ) -> None:
@@ -52,7 +50,6 @@ class ModelRunner:
         self.return_logprobs = return_logprobs
         self.use_cuda_graph_varlen, self.use_cuda_graph_decode = self.cb_config.cuda_graph_booleans
         self.cache = cache
-        self.encoder_cache = encoder_cache
 
         # Padding only happen when CUDA graphs or compile is used
         cuda_graph = self.use_cuda_graph_varlen or self.use_cuda_graph_decode
@@ -105,14 +102,16 @@ class ModelRunner:
 
     def run_encoder(self, model: nn.Module, encoder_kwargs: list[dict]) -> None:
         """Runs the encoder on the given set of kwargs and stores the new embeddings in the encoder cache."""
+        if self.cache.encoder_cache is None:
+            raise ValueError("Cannot run encoder because there is no encoder cache.")
         with self.compute_stream_ctx():
             for encoder_kw in encoder_kwargs:
                 encoder_kw["return_dict"] = True
-                request_id = encoder_kw.pop(self.encoder_cache.REQUEST_ID_KEY)
-                encoding_fn = getattr(model, self.encoder_cache.encoding_fn_name)
+                request_id = encoder_kw.pop(self.cache.encoder_cache.REQUEST_ID_KEY)
+                encoding_fn = getattr(model, self.cache.encoder_cache.encoding_fn_name)
                 encoding_output = encoding_fn(**encoder_kw)
-                mm_embeddings = self.encoder_cache.extract_mm_embeddings(encoding_output)
-                self.encoder_cache.store_mm_embeddings(request_id, mm_embeddings)
+                mm_embeddings = self.cache.encoder_cache.extract_mm_embeddings(encoding_output)
+                self.cache.encoder_cache.store_mm_embeddings(request_id, mm_embeddings)
 
     def fill_inputs_embeds(self, model: nn.Module, batch_data: PagedAttentionArgs) -> None:
         """Fill the inputs_embeds tensor inside the batch_data dictionary."""
@@ -126,7 +125,7 @@ class ModelRunner:
         if mm_embeddings_read_index is None:
             return None
         # Otherwise, retrieve the multimodal embeddings according to the index
-        mm_embeddings = self.encoder_cache.cache[mm_embeddings_read_index] # shape [q_tokens, hidden_size]
+        mm_embeddings = self.cache.encoder_cache.cache[mm_embeddings_read_index] # shape [q_tokens, hidden_size] # type: ignore
         mm_embeddings = mm_embeddings.unsqueeze(0)  # shape [1, q_tokens, hidden_size]
         mask = (mm_embeddings_read_index == -1).unsqueeze(-1)  # shape [1, q_tokens]
         inputs_embeds.copy_(torch.where(mask, inputs_embeds, mm_embeddings))

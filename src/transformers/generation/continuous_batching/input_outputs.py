@@ -22,7 +22,6 @@ from transformers.configuration_utils import PretrainedConfig
 from ...utils import get_available_devices
 from .cache import PagedAttentionCache
 from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
-from .encoder_cache import EncoderCache
 from .requests import TMP_TOKEN_ID, FutureRequestState, logger
 from .utils import CudaGraphBuffer, aligned_divide, attn_mask_is_needed, build_attention_mask, pad_to_pow2
 
@@ -83,7 +82,6 @@ class ContinuousBatchingIOs:
     def __init__(
         self,
         cache: PagedAttentionCache,
-        encoder_cache: EncoderCache | None,
         config: PretrainedConfig,
         device: torch.device,
         model_dtype: torch.dtype,
@@ -106,7 +104,6 @@ class ContinuousBatchingIOs:
         """
         # Memoize attributes
         self.cache = cache
-        self.encoder_cache = encoder_cache
         self.device = device
         self.config = config
         self.model_dtype = model_dtype
@@ -129,7 +126,7 @@ class ContinuousBatchingIOs:
         self.graphs: CudaGraphBuffer = CudaGraphBuffer(max_graphs)
         self._trash_index = cache.trash_index
         # Setup static tensors and compute stream
-        _use_inputs_embeds = (encoder_cache is not None) if _use_inputs_embeds is None else _use_inputs_embeds
+        _use_inputs_embeds = (cache.encoder_cache is not None) if _use_inputs_embeds is None else _use_inputs_embeds
         self._setup_static_tensors(logit_processor=logit_processor, use_inputs_embeds=_use_inputs_embeds)
         self._reset_static_tensors(full_reset=True)
         self.compute_stream = torch.cuda.Stream(device=self.device) if device.type == "cuda" else None
@@ -426,8 +423,8 @@ class ContinuousBatchingIOs:
                     state.request_id, past_length, query_length, read_index, write_index
                 )
             # Also accumulate the encoder cache read index if there is an encoder cache
-            if self.encoder_cache is not None:
-                self.encoder_cache_read |= self.encoder_cache.extend_read_indices(
+            if self.cache.encoder_cache is not None:
+                self.encoder_cache_read |= self.cache.encoder_cache.extend_read_indices(
                     state.request_id, past_length, query_length, encoder_cache_read_index
                 )
 
@@ -440,7 +437,7 @@ class ContinuousBatchingIOs:
             # If the request is an encoder request, we accumulate the encoder arguments
             if state.multimodal_inputs:
                 mm_data = state.multimodal_inputs
-                mm_data[self.encoder_cache.REQUEST_ID_KEY] = state.request_id  # type: ignore (was already checked)
+                mm_data[self.cache.encoder_cache.REQUEST_ID_KEY] = state.request_id  # type: ignore (was already checked)
                 self.encoder_kwargs.append(mm_data)
                 state.multimodal_inputs = {}  # means there was multimodal data and it has already been processed
 
@@ -592,7 +589,6 @@ class HostDeviceIOPair:
     def __init__(
         self,
         cache: PagedAttentionCache,
-        encoder_cache: EncoderCache | None,
         config: PretrainedConfig,
         device: torch.device,
         model_dtype: torch.dtype,
@@ -604,7 +600,6 @@ class HostDeviceIOPair:
         # The host IO has automatic pinned memory because it is created on the CPU
         self.host_io = ContinuousBatchingIOs(
             cache=cache,
-            encoder_cache=encoder_cache,
             config=config,
             device=torch.device("cpu"),
             model_dtype=model_dtype,
@@ -616,7 +611,6 @@ class HostDeviceIOPair:
         )
         self.device_io = ContinuousBatchingIOs(
             cache=cache,
-            encoder_cache=encoder_cache,
             config=config,
             device=device,
             model_dtype=model_dtype,
@@ -696,7 +690,6 @@ class ContinuousBatchingAsyncIOs:
     def __init__(
         self,
         cache: PagedAttentionCache,
-        encoder_cache: EncoderCache | None,
         config: PretrainedConfig,
         device: torch.device,
         model_dtype: torch.dtype,
@@ -713,7 +706,6 @@ class ContinuousBatchingAsyncIOs:
         self.io_pairs = [
             HostDeviceIOPair(
                 cache=cache,
-                encoder_cache=encoder_cache,
                 config=config,
                 device=device,
                 model_dtype=model_dtype,

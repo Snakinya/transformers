@@ -16,7 +16,6 @@ from abc import ABC, abstractmethod
 from collections import deque
 
 from .cache import PagedAttentionCache
-from .encoder_cache import EncoderCache
 from .requests import FutureRequestState, RequestState, RequestStatus, logger
 
 
@@ -27,9 +26,8 @@ class Scheduler(ABC):
     schedulers implement different strategies for prioritizing and batching requests.
     """
 
-    def __init__(self, cache: PagedAttentionCache, encoder_cache: EncoderCache | None):
+    def __init__(self, cache: PagedAttentionCache):
         self.cache = cache
-        self.encoder_cache = encoder_cache
         self._cancellation_lock = threading.Lock()
         # This is to compute the read cache used by a new request being scheduled
         self.read_cache_limit = None if self.cache.num_full_attention_groups else self.cache.max_sliding_window
@@ -117,9 +115,9 @@ class Scheduler(ABC):
 
     def _can_store_mm_embeddings(self, state: RequestState) -> bool:
         """Checks if there is enough space in the encoder cache to store the multimodal embeddings."""
-        if self.encoder_cache is None:
+        if self.cache.encoder_cache is None:
             raise ValueError(f"Request has multimodal data but there is no encoder cache: {state = }")
-        return self.encoder_cache.can_store_mm_embeddings(state)
+        return self.cache.encoder_cache.can_store_mm_embeddings(state)
 
     def _allocate_blocks_if_needed(self, state: RequestState, len_next_tokens: int) -> bool:
         """Allocate additional cache blocks for a request if the currently allocated blocks are insufficient to
@@ -271,9 +269,9 @@ class Scheduler(ABC):
 
             # If the request has multimodal data to process, we allocate space in the encoder cache
             if state.multimodal_inputs:
-                if self.encoder_cache is None:
+                if self.cache.encoder_cache is None:
                     raise ValueError(f"Request has multimodal data but there is no encoder cache: {state = }")
-                self.encoder_cache.allocate_blocks(state)
+                self.cache.encoder_cache.allocate_blocks(state)
 
             # The decode fast path is only used if the request is a single token and its length is less than the max blocks per request
             decode_fast_path &= request_len == 1 and state.position_offset < self.max_decode_fast_path_length
@@ -338,12 +336,12 @@ class FIFOScheduler(Scheduler):
     prefilling requests. Additionally, it includes a safety margin mechanism to prevent cache exhaustion. By default,
     when 80% of the cache is full, new requests will not be scheduled to prioritize decoding active requests."""
 
-    def __init__(self, cache: PagedAttentionCache, encoder_cache: EncoderCache | None, safety_margin: float = 0.2):
+    def __init__(self, cache: PagedAttentionCache, safety_margin: float = 0.2):
         """Initializes the FIFO scheduler. The safety margin is the percentage of free blocks under which we stop
         scheduling new prefill requests, so safety_margin = 0.1 means that when there is less than 10% of free blocks,
         or equivalently when more than 90% of blocks are already allocated, we stop scheduling new prefill requests.
         """
-        super().__init__(cache, encoder_cache)
+        super().__init__(cache)
         self.safety_margin = safety_margin
 
     def schedule_batch(
