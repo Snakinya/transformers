@@ -72,12 +72,14 @@ def attn_mask_is_needed(config: PretrainedConfig) -> bool:
     """Checks if attention mask is needed for the given (config)."""
     return config._attn_implementation in ["paged|eager", "paged|sdpa"]
 
+
 def find_num_kv_heads(config: PretrainedConfig) -> int | None:
     """Finds the number of key-value heads for the given config."""
     for attr in ["num_key_value_heads", "num_attention_heads"]:
         if hasattr(config, attr):
             return getattr(config, attr)
     raise ValueError(f"num_key_value_heads or num_attention_heads could not be found in the config:\n{config}")
+
 
 def find_head_dim(config: PretrainedConfig) -> int | None:
     """Finds the head dimension for the given config."""

@@ -77,7 +77,7 @@ class ContinuousBatchingIOs:
     batch alone.
     """
 
-    static_inputs: int = 8 # Number of static inputs always present in the bulk tensor
+    static_inputs: int = 8  # Number of static inputs always present in the bulk tensor
 
     def __init__(
         self,
@@ -171,7 +171,7 @@ class ContinuousBatchingIOs:
         full_attention_cumulative_seqlens_k = self._bulk_input_tensor[4, : max_batch_tokens + 1]
         sliding_attention_cumulative_seqlens_k = self._bulk_input_tensor[5, : max_batch_tokens + 1]
         self.carry_over_ids = self._bulk_input_tensor[6, :max_batch_tokens]  # only used for async API
-        self.encoder_cache_read_index = self._bulk_input_tensor[7, : max_batch_tokens]  # only used for multimodal model
+        self.encoder_cache_read_index = self._bulk_input_tensor[7, :max_batch_tokens]  # only used for multimodal model
 
         # For sequence length of KV, the entries in the dict depend on the model
         self.cumulative_seqlens_k: dict[str, torch.Tensor] = {}
@@ -184,7 +184,7 @@ class ContinuousBatchingIOs:
         if use_inputs_embeds:
             hidden_size = getattr(self.config, "hidden_size", self.config.text_config.hidden_size)
             self.inputs_embeds = torch.empty(
-                (max_batch_tokens, hidden_size), dtype=self.model_dtype, device=self.device,
+                (max_batch_tokens, hidden_size), dtype=self.model_dtype, device=self.device
             )
         else:
             self.inputs_embeds = None

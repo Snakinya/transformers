@@ -76,14 +76,12 @@ class ModelRunner:
                 self._forward_process_and_sample, **self.cb_config.decode_compile_config.to_dict()
             )
 
-
     def compute_stream_ctx(self) -> torch.cuda.Stream | nullcontext:
         """Returns a context manager that runs enclosed ops on the compute stream, or a no-op when none is set."""
         compute_stream = self.inputs_and_outputs.compute_stream
         if compute_stream is None:
             return nullcontext()
         return torch.cuda.stream(compute_stream)
-
 
     def maybe_pad_inputs(self, num_q_tokens: int, max_kv_read: int, use_decode_fast_path: bool) -> tuple[int, int]:
         """Pads the input sizes for the next batch if it is needed. Often it is, for max performance."""
@@ -125,18 +123,16 @@ class ModelRunner:
         if mm_embeddings_read_index is None:
             return None
         # Otherwise, retrieve the multimodal embeddings according to the index
-        mm_embeddings = self.cache.encoder_cache.cache[mm_embeddings_read_index] # shape [q_tokens, hidden_size] # type: ignore
+        mm_embeddings = self.cache.encoder_cache.cache[mm_embeddings_read_index]  # type: ignore
         mm_embeddings = mm_embeddings.unsqueeze(0)  # shape [1, q_tokens, hidden_size]
         mask = (mm_embeddings_read_index == -1).unsqueeze(-1)  # shape [1, q_tokens]
         inputs_embeds.copy_(torch.where(mask, inputs_embeds, mm_embeddings))
-
 
     def _pop_or_get_input_ids(self, batch_data: PagedAttentionArgs) -> torch.Tensor:
         """Retrieves the input ids from the batch data, popping it if the inputs_embeds are present."""
         if batch_data["inputs_embeds"] is not None:
             return batch_data.pop("input_ids")
         return batch_data["input_ids"]
-
 
     def compute_batch(self, model: nn.Module, batch_data: PagedAttentionArgs) -> None:
         """Runs the forward pass, processes the logits and samples the next tokens. It also handles which version of

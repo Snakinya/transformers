@@ -25,7 +25,6 @@ from .requests import RequestState
 
 # TODO: add block-based indexing
 class EncoderCache:
-
     cache: torch.Tensor
     REQUEST_ID_KEY: str = "_cb_request_id"
 
@@ -104,7 +103,7 @@ class EncoderCache:
         allocated_blocks = [self.free_blocks.popleft() for _ in range(num_mm_embeddings)]
         # Infer the allocated blocks mask
         input_ids = torch.tensor(state.initial_tokens, device="cpu", dtype=torch.int32)
-        img_mask = (input_ids == self.special_token_id)
+        img_mask = input_ids == self.special_token_id
         input_ids.fill_(-1)
         input_ids[img_mask] = torch.tensor(allocated_blocks, device="cpu", dtype=torch.int32)
         self.allocated_blocks_masks[state.request_id] = input_ids
@@ -131,10 +130,10 @@ class EncoderCache:
         block_table = self.allocated_blocks_masks.get(request_id)
         # Only compute read indices if the request has allocated blocks
         if block_table is not None:
-            intersection = block_table[past_length:past_length + query_length].tolist()
+            intersection = block_table[past_length : past_length + query_length].tolist()
             missing_indices = query_length - len(intersection)
             # Check if any of the multimodal embeddings for this request are read in this batch
-            cache_read = (block_table[past_length:past_length + query_length] != -1).any().item()
+            cache_read = (block_table[past_length : past_length + query_length] != -1).any().item()
             # Check if all the multimodal embeddings for this request have been read
             if past_length + query_length >= len(block_table):
                 self.outgoing_requests.add(request_id)

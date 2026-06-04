@@ -1224,7 +1224,7 @@ class ContinuousMixin:
                     inputs=inputs,
                     multimodal_inputs=multimodal_inputs,
                     max_new_tokens=max_new_tokens,
-                    record_timestamps=record_timestamps
+                    record_timestamps=record_timestamps,
                 )
                 while finished_count < num_requests:
                     result = manager.get_result(timeout=1)
