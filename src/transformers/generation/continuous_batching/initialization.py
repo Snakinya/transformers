@@ -39,10 +39,8 @@ def resolve_continuous_batching_config(
 
     # Look at whether the user explicitly asked for the decode fast path before we assign a default value
     user_requested_decode_path = cb_config.max_blocks_per_request is not None
-    # Same for cuda graphs, if the user signals they want CUDA graphs via any padding/cached-graph parameter
-    cuda_graph_requested = any(
-        [cb_config.q_padding_interval_size, cb_config.kv_padding_interval_size, cb_config.max_cached_graphs]
-    )
+    # Same for cuda graphs, if the user signals they want CUDA graphs via the max_cached_graphs parameter
+    cuda_graph_requested = cb_config.max_cached_graphs > 0
 
     # Resolve missing attributes for which we have hints. Must happen before no-hints resolve.
     resolve_using_hints(cb_config, workload_hints)
@@ -89,10 +87,6 @@ def resolve_without_hints(cb_config: ContinuousBatchingConfig) -> None:
     """Fills any remaining unset/sentinel attribute with a fallback default."""
     if cb_config.max_blocks_per_request is None:
         cb_config.max_blocks_per_request = 32
-    if cb_config.q_padding_interval_size == 0:
-        cb_config.q_padding_interval_size = 64
-    if cb_config.kv_padding_interval_size == 0:
-        cb_config.kv_padding_interval_size = 64 * 256  # 64 blocks of 256 tokens ie. 16384 tokens
     if cb_config.max_cached_graphs == 0:
         cb_config.max_cached_graphs = 32
 
