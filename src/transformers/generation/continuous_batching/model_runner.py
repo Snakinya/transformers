@@ -109,13 +109,10 @@ class ModelRunner:
             for encoder_kw in encoder_kwargs:
                 encoder_kw["return_dict"] = True
                 request_id = encoder_kw.pop(self.encoder_cache.REQUEST_ID_KEY)
-                image_features_tuple = model.get_image_features(**encoder_kw).pooler_output
-                if isinstance(image_features_tuple, torch.Tensor):
-                    image_features = image_features_tuple
-                else:
-                    image_features = torch.cat(image_features_tuple, dim=0)
-                self.encoder_cache.store_mm_embeddings(request_id, image_features)
-
+                encoding_fn = getattr(model, self.encoder_cache.encoding_fn_name)
+                encoding_output = encoding_fn(**encoder_kw)
+                mm_embeddings = self.encoder_cache.extract_mm_embeddings(encoding_output)
+                self.encoder_cache.store_mm_embeddings(request_id, mm_embeddings)
 
     def fill_inputs_embeds(self, model: nn.Module, batch_data: PagedAttentionArgs) -> None:
         """Fill the inputs_embeds tensor inside the batch_data dictionary."""

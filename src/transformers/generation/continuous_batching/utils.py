@@ -195,26 +195,28 @@ def build_attention_mask(
         attention_mask[..., query_range, key_range] = masked
 
 
-def check_modality_support(input_modalities: str | list[str]) -> bool:
+def check_modality_support(input_modalities: str | list[str]) -> str | None:
     """Check if CB supports the given input modalities and returns True if the model is multimodal."""
     input_modalities = [input_modalities] if isinstance(input_modalities, str) else input_modalities
 
-    # Raise an error if the model supports no modalities in CB's supported set
-    supported_modalities = set(input_modalities).intersection({"text", "image"})
-    if len(supported_modalities) == 0:
-        raise ValueError(f"This model supports {input_modalities = } but CB only supports text and image.")
+    # We only support text and image or text and audio for now
+    supported_modalities = set(input_modalities).intersection({"text", "image", "audio"})
+    if len(supported_modalities) not in {1, 2} or "text" not in supported_modalities:
+        raise ValueError(f"This model supports {input_modalities = } but CB only supports text+image or text+audio.")
 
     # Throw a warning if the model supports modalities that are not in CB's supported set
     unsupported_modalities = set(input_modalities) - supported_modalities
     if len(unsupported_modalities) > 0:
         logger.warning(
-            f"This model supports {input_modalities = } but CB only supports text and image. "
+            f"This model supports {input_modalities = } but CB only supports text+image or text+audio. "
             f"The following modalities will be ignored: {unsupported_modalities = }"
         )
 
-    # The encoder cache is only needed if the model supports a CB-supported modality other than text
-    use_encoder_cache = "image" in input_modalities
-    return use_encoder_cache
+    # Return the non-textual modality if there is one
+    if len(supported_modalities) == 2:
+        supported_modalities.remove("text")
+        return supported_modalities.pop()
+    return None
 
 
 def create_warmup_future_states(

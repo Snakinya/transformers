@@ -967,12 +967,12 @@ class ContinuousBatchingManager:
             return batch_processor
 
         # Create the paged attention cache (for KV) and maybe an encoder cache (for multimodal embeddings)
-        is_multimodal_model = check_modality_support(self.model.input_modalities)
+        modality = check_modality_support(self.model.input_modalities)
         # The KV cache is dimensionned to take the encoder cache into account if there is one
         paged_attention_cache = PagedAttentionCache(
             config=self.model.config,
             continuous_batching_config=self.continuous_batching_config,
-            is_multimodal_model=is_multimodal_model,
+            is_multimodal_model=modality is not None,
             device=self.model.device,
             dtype=self.model.dtype,
             distributed_helper=self.distributed_helper,
@@ -980,9 +980,10 @@ class ContinuousBatchingManager:
         )
         self._use_prefix_sharing = paged_attention_cache.use_prefix_sharing  # update the approximation
         # Create the encoder cache if needed
-        if is_multimodal_model:
+        if modality is not None:
             encoder_cache = EncoderCache(
                 config=self.model.config,
+                modality=modality,
                 max_batch_tokens=paged_attention_cache.max_batch_tokens,
                 use_async_batching=self.continuous_batching_config.use_async_batching,
                 model_dtype=self.model.dtype,

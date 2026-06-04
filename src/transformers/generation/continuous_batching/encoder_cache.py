@@ -15,6 +15,7 @@
 
 from collections import deque
 from itertools import repeat
+from typing import Any
 
 import torch
 
@@ -31,15 +32,13 @@ class EncoderCache:
     def __init__(
         self,
         config: PretrainedConfig,
+        modality: str,
         max_batch_tokens: int,
         use_async_batching: bool,
         model_dtype: torch.dtype,
         device: torch.device,
     ) -> None:
         self.use_async_batching = use_async_batching
-        self.image_token_id = config.image_token_id
-        if not isinstance(self.image_token_id, int) or self.image_token_id <= 0:
-            raise ValueError(f"Image token ID must be a positive integer but got {self.image_token_id = }")
         # Create the actual cache tensor
         cache_size = max(16384, max_batch_tokens)
         cache_shape = (cache_size, config.text_config.hidden_size)
@@ -49,6 +48,44 @@ class EncoderCache:
         self.allocated_blocks_masks: dict[str, torch.Tensor] = {}
         self.embeddings_lengths: dict[str, int] = {}
         self.outgoing_requests: set[str] = set()
+        # Specialize on modality the encoder cache object
+        self._specialize_on_modality(config, modality)
+
+    def _specialize_on_modality(self, config: PretrainedConfig, modality: str) -> None:
+        # Retrieve special token ID and encoding functions names
+        if modality == "image":
+            possible_token_names = ["image_token_id", "image_token_index"]
+            encoding_fn_name = "get_image_features"
+        elif modality == "audio":
+            possible_token_names = ["audio_token_id", "audio_token_index"]
+            encoding_fn_name = "get_audio_features"
+        else:
+            raise ValueError(f"Invalid modality: {modality}")
+        # Retrieve the actual token ID for the modality
+        token_id = None
+        for token_name in possible_token_names:
+            if hasattr(config, token_name):
+                token_id = getattr(config, token_name)
+                break
+        if not isinstance(token_id, int) or token_id <= 0:
+            raise ValueError(f"{token_name} token ID must be a positive integer but got {token_id = }")
+        # Save attribute values
+        self.special_token_id = token_id
+        self.encoding_fn_name = encoding_fn_name
+
+    def extract_mm_embeddings(self, encoding_output: Any) -> torch.Tensor:
+        """Extracts the multimodal embeddings from the encoding output."""
+        og_encoding_output = encoding_output
+        # In most cases, the relevant outputs are located in the pooler_output attribute
+        if hasattr(encoding_output, "pooler_output"):
+            encoding_output = encoding_output.pooler_output
+        # If the pooler output is a tuple or a list, use concatenate to get a tensor
+        if isinstance(encoding_output, tuple) or isinstance(encoding_output, list):
+            return torch.cat(encoding_output, dim=0)
+        # Otherwise, return if the output is a tensor
+        if isinstance(encoding_output, torch.Tensor):
+            return encoding_output
+        raise ValueError(f"Invalid encoding output: {og_encoding_output}")
 
     def can_store_mm_embeddings(self, state: RequestState) -> bool:
         """Checks if there is enough space in the encoder cache to store the multimodal embeddings."""
@@ -56,7 +93,7 @@ class EncoderCache:
         num_mm_embeddings = self.embeddings_lengths.get(state.request_id)
         if num_mm_embeddings is None:
             input_ids = torch.tensor(state.initial_tokens, device="cpu", dtype=torch.int32)
-            num_mm_embeddings = (input_ids == self.image_token_id).sum().item()
+            num_mm_embeddings = (input_ids == self.special_token_id).sum().item()
             self.embeddings_lengths[state.request_id] = num_mm_embeddings
         return len(self.free_blocks) >= num_mm_embeddings
 
@@ -67,7 +104,7 @@ class EncoderCache:
         allocated_blocks = [self.free_blocks.popleft() for _ in range(num_mm_embeddings)]
         # Infer the allocated blocks mask
         input_ids = torch.tensor(state.initial_tokens, device="cpu", dtype=torch.int32)
-        img_mask = (input_ids == self.image_token_id)
+        img_mask = (input_ids == self.special_token_id)
         input_ids.fill_(-1)
         input_ids[img_mask] = torch.tensor(allocated_blocks, device="cpu", dtype=torch.int32)
         self.allocated_blocks_masks[state.request_id] = input_ids
