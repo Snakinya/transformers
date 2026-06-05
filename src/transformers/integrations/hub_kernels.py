@@ -91,6 +91,14 @@ try:
                 layer_name="MultiScaleDeformableAttention",
             )
         },
+        "ESMFold2TriangleMultiplication": {
+            "cuda": {
+                Mode.INFERENCE: LayerRepository(
+                    repo_id="Rocketknight1/esmfold2-trimul-kernel",
+                    layer_name="ESMFold2TriangleMultiplication",
+                ),
+            },
+        },
         "Llama4TextMoe": {
             "cuda": LayerRepository(
                 repo_id="kernels-community/moe",
